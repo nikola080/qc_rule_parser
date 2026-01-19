@@ -725,97 +725,36 @@ namespace ETL_rod787.Services
             }
 
             // 8) Map table names to CamelCase as in DDL (both quoted and unquoted)
-            var tableMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            // Use table_columns dictionary populated by DDL parsing
+            foreach (var tableNameEntry in table_columns)
             {
-                { "aggregateddata", "AggregatedData" },
-                { "disaggregateddata", "DisaggregatedData" },
-                { "aggregateddatabywaterbody", "AggregatedDataByWaterBody" }
-            };
+                string originalTableName = tableNameEntry.Key; // This is the CamelCase name from DDL
+                string lowerTableName = originalTableName.ToLowerInvariant(); // For matching lowercase in query
 
-            // quoted replacements first
-            foreach (var kv in tableMap)
-            {
-                sql = Regex.Replace(sql, $"\"{kv.Key}\"", $"\"{kv.Value}\"", RegexOptions.IgnoreCase);
-            }
-            // unquoted (standalone) replacements - use verbatim interpolated string and Regex.Escape
-            foreach (var kv in tableMap)
-            {
-                sql = Regex.Replace(sql, $@"\b{Regex.Escape(kv.Key)}\b", kv.Value, RegexOptions.IgnoreCase);
+                // Replace quoted lowercase table names: "monitoringresult" -> "MonitoringResult"
+                sql = Regex.Replace(sql, $@"""{Regex.Escape(lowerTableName)}""", $"\"{originalTableName}\"", RegexOptions.IgnoreCase);
+                // Replace unquoted lowercase table names - wrap in quotes for PostgreSQL
+                // Only match if definitely not inside quotes (not preceded or followed by quote)
+                sql = Regex.Replace(sql, $@"(?<![""])\b{Regex.Escape(lowerTableName)}\b(?![""])", $"\"{originalTableName}\"", RegexOptions.IgnoreCase);
             }
 
             // 9) Map column names (lowercase gathered) to CamelCase per DDL
-            var colMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                { "monitoringsiteidentifier", "monitoringSiteIdentifier" },
-                { "monitoringsiteidentifierscheme", "monitoringSiteIdentifierScheme" },
-                { "parameterwaterbodycategory", "parameterWaterBodyCategory" },
-                { "observedpropertydeterminandcode", "observedPropertyDeterminandCode" },
-                { "procedureanalysedmatrix", "procedureAnalysedMatrix" },
-                { "resultuom", "resultUom" },
-                { "phenomenontimereferenceyear", "phenomenonTimeReferenceYear" },
-                { "parametersamplingperiod", "parameterSamplingPeriod" },
-                { "procedureloqvalue", "procedureLOQValue" },
-                { "resultnumberofsamples", "resultNumberOfSamples" },
-                { "resultqualitynumberofsamplesbelowloq", "resultQualityNumberOfSamplesBelowLOQ" },
-                { "resultqualityminimumbelowloq", "resultQualityMinimumBelowLOQ" },
-                { "resultminimumvalue", "resultMinimumValue" },
-                { "resultqualitymeanbelowloq", "resultQualityMeanBelowLOQ" },
-                { "resultmeanvalue", "resultMeanValue" },
-                { "resultqualitymaximumbelowloq", "resultQualityMaximumBelowLOQ" },
-                { "resultmaximumvalue", "resultMaximumValue" },
-                { "resultqualitymedianbelowloq", "resultQualityMedianBelowLOQ" },
-                { "resultmedianvalue", "resultMedianValue" },
-                { "resultstandarddeviationvalue", "resultStandardDeviationValue" },
-                { "procedureanalyticalmethod", "procedureAnalyticalMethod" },
-                { "parametersampledepth", "parameterSampleDepth" },
-                { "resultobservationstatus", "resultObservationStatus" },
-                { "remarks", "remarks" },
-                { "_submission_id", "_submission_id" },
-                { "_submission_id_monitoring_site", "_submission_id_monitoring_site" },
-                { "waterbodyidentifier", "waterBodyIdentifier" },
-                { "waterbodyidentifierscheme", "waterBodyIdentifierScheme" },
-                { "resultnumberofsitesclass1", "resultNumberOfSitesClass1" },
-                { "resultnumberofsitesclass2", "resultNumberOfSitesClass2" },
-                { "resultnumberofsitesclass3", "resultNumberOfSitesClass3" },
-                { "resultnumberofsitesclass4", "resultNumberOfSitesClass4" },
-                { "resultnumberofsitesclass5", "resultNumberOfSitesClass5" },
-                { "submission_id", "submission_id" },
-                { "_submission_id_surface_water_body", "_submission_id_surface_water_body" },
-                { "_submission_id_ground_water_body", "_submission_id_ground_water_body" },
+            // Special case: always translate record_id to _id
+            sql = Regex.Replace(sql, $@"""record_id""", $@"""_id""", RegexOptions.IgnoreCase);
+            sql = Regex.Replace(sql, $@"\brecord_id\b", @"""_id""", RegexOptions.IgnoreCase);
+            sql = Regex.Replace(sql, $@"""recordid""", $@"""_id""", RegexOptions.IgnoreCase);
+            sql = Regex.Replace(sql, $@"\brecordid\b", @"""_id""", RegexOptions.IgnoreCase);
 
-                // Disaggregated-specific
-                { "phenomenontimesamplingdate", "phenomenonTimeSamplingDate" },
-                { "sampleidentifier", "sampleIdentifier" },
-                { "resultobservedvalue", "resultObservedValue" },
-                { "resultqualityobservedvaluebelowloq", "resultQualityObservedValueBelowLOQ" },
-                { "parametersedimentdepthsampled", "parameterSedimentDepthSampled" },
-                { "parameterspecies", "parameterSpecies" },
-                { "resultmoisture", "resultMoisture" },
-                { "resultfat", "resultFat" },
-                { "resultextractablelipid", "resultExtractableLipid" },
-                { "resultlipid", "resultLipid" },
-
-                // special cases - ALWAYS translate record_id to _id
-                { "record_id", "_id" },
-                { "recordid", "_id" },
-                { "\"record_id\"", "\"_id\"" },
-                { "\"recordId\"", "\"_id\"" }
-            };
-            
-            // ALWAYS ensure record_id -> _id translation (apply first, before other column mappings)
-            sql = Regex.Replace(sql, @"""record_id""", @"""_id""", RegexOptions.IgnoreCase);
-            sql = Regex.Replace(sql, @"\brecord_id\b", "_id", RegexOptions.IgnoreCase);
-            sql = Regex.Replace(sql, @"\brecordId\b", "_id", RegexOptions.IgnoreCase);
-
-            // perform quoted column replacements first
-            foreach (var kv in colMap)
+            // Use ColumnNameMap dictionary populated by DDL parsing (lowercase -> CamelCase)
+            foreach (var kv in ColumnNameMap)
             {
-                sql = Regex.Replace(sql, $"\"{kv.Key}\"", $"\"{kv.Value}\"", RegexOptions.IgnoreCase);
-            }
-            // then unquoted standalone columns - use verbatim interpolated string and Regex.Escape
-            foreach (var kv in colMap)
-            {
-                sql = Regex.Replace(sql, $@"\b{Regex.Escape(kv.Key)}\b", kv.Value, RegexOptions.IgnoreCase);
+                // Step 1: Replace quoted lowercase column names: "season" -> "Season"
+                sql = Regex.Replace(sql, $"\"{Regex.Escape(kv.Key)}\"", $"\"{kv.Value}\"", RegexOptions.IgnoreCase);
+                
+                // Step 2: Replace unquoted lowercase column names - wrap in quotes for PostgreSQL
+                // Match only if NOT inside quotes - check that there's no quote immediately before or after
+                // Use a more precise pattern that won't match if the column is between quotes
+                sql = Regex.Replace(sql, $@"(?<!"")\b{Regex.Escape(kv.Key)}\b(?!\"")", $"\"{kv.Value}\"", RegexOptions.IgnoreCase);
             }
 
             // 10) Remove ISNUMERIC checks for numeric/boolean columns (for both SQL Server and PostgreSQL queries)

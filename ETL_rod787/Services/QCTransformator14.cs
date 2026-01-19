@@ -39,31 +39,11 @@ namespace ETL_rod787.Services
         protected readonly IWorkbook? workbook;
 
         protected JsonArray qcRules = new();
-        protected string[] columns = new string[]
-        {
-            "aggregateddata", "monitoringsiteidentifier", "monitoringsiteidentifierscheme", "parameterwaterbodycategory",
-            "observedpropertydeterminandcode", "procedureanalysedmatrix", "resultuom", "phenomenontimereferenceyear", "parametersamplingperiod",
-            "procedureloqvalue", "resultnumberofsamples", "resultqualitynumberofsamplesbelowloq", "resultqualityminimumbelowloq", "resultminimumvalue",
-            "resultqualitymeanbelowloq", "resultmeanvalue", "resultqualitymaximumbelowloq", "resultmaximumvalue", "resultqualitymedianbelowloq",
-            "resultmedianvalue", "resultstandarddeviationvalue", "procedureanalyticalmethod", "parametersampledepth", "resultobservationstatus",
-            "remarks", "_submission_id", "_id", "_submission_id_monitoring_site", "aggregateddatabywaterbody", "waterbodyidentifier", "" +
-            "waterbodyidentifierscheme", "parameterwaterbodycategory", "observedpropertydeterminandcode", "procedureanalysedmatrix", "resultuom",
-            "phenomenontimereferenceyear", "parametersamplingperiod", "procedureloqvalue", "resultnumberofsamples", "resultqualitynumberofsamplesbelowloq",
-            "resultqualityminimumbelowloq", "resultminimumvalue", "resultqualitymeanbelowloq", "resultmeanvalue", "resultqualitymaximumbelowloq",
-            "resultmaximumvalue", "resultqualitymedianbelowloq", "resultmedianvalue", "resultstandarddeviationvalue", "resultnumberofsitesclass1",
-            "resultnumberofsitesclass2", "resultnumberofsitesclass3", "resultnumberofsitesclass4", "resultnumberofsitesclass5", "resultobservationstatus",
-            "remarks", "submission_id", "_id", "_submission_id_surface_water_body", "_submission_id_ground_water_body", "disaggregateddata",
-            "monitoringsiteidentifier", "monitoringsiteidentifierscheme", "parameterwaterbodycategory", "observedpropertydeterminandcode",
-            "procedureanalysedmatrix", "resultuom", "phenomenontimesamplingdate", "sampleidentifier", "resultobservedvalue",
-            "resultqualityobservedvaluebelowloq", "procedureloqvalue", "parametersampledepth", "parametersedimentdepthsampled",
-            "parameterspecies", "resultmoisture", "resultfat", "resultextractablelipid", "resultlipid", "resultobservationstatus", "" +
-            "remarks", "_submission_id", "_id", "_submission_id_monitoring_site"
-        };
 
         protected Dictionary<string, string[]> table_columns = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
-        private int expressionsStartRow = 2;
-        private int expressionsEndRow = 216;
+        private int expressionsStartRow = 106;
+        private int expressionsEndRow = 214;
 
         /// <summary>
         /// Column name mapping to CamelCase format used in DDL (lowercase -> CamelCase)
@@ -83,7 +63,7 @@ namespace ETL_rod787.Services
         /// </summary>
         protected Dictionary<string, string> SchemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        public QCTransformator14(string path, string ddl, Dictionary<string, string>? schemaMap = null, int expressionsStartRow = 2, int expressionsEndRow = 216)
+        public QCTransformator14(string path, string ddl, Dictionary<string, string>? schemaMap = null, int expressionsStartRow = 106, int expressionsEndRow = 214)
         {
             try
             {
@@ -657,8 +637,12 @@ namespace ETL_rod787.Services
             }
 
             var cteColumnsAll = cteColsMap.SelectMany(kv => kv.Value).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            var tempColumns = columns.Concat(cteColumnsAll).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            var tableNames = cteColsMap.Keys.Concat(new[] { "aggregateddata", "disaggregateddata", "aggregateddatabywaterbody" }).ToArray();
+            // Get all columns from DDL tables (lowercase keys from ColumnNameMap)
+            var ddlColumns = ColumnNameMap.Keys.ToArray();
+            var tempColumns = ddlColumns.Concat(cteColumnsAll).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            // Get all table names from DDL (lowercase keys from table_columns)
+            var ddlTableNames = table_columns.Keys.Select(t => t.ToLowerInvariant()).ToArray();
+            var tableNames = cteColsMap.Keys.Concat(ddlTableNames).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
             // collect referenced tables/columns/schemas
             var referencedTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -906,8 +890,12 @@ namespace ETL_rod787.Services
             }
 
             var cteColumnsAll = cteColsMap.SelectMany(kv => kv.Value).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            var tempColumns = columns.Concat(cteColumnsAll).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            var tableNames = cteColsMap.Keys.Concat(new[] { "aggregateddata", "disaggregateddata", "aggregateddatabywaterbody" }).ToArray();
+            // Get all columns from DDL tables (lowercase keys from ColumnNameMap)
+            var ddlColumns = ColumnNameMap.Keys.ToArray();
+            var tempColumns = ddlColumns.Concat(cteColumnsAll).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            // Get all table names from DDL (lowercase keys from table_columns)
+            var ddlTableNames = table_columns.Keys.Select(t => t.ToLowerInvariant()).ToArray();
+            var tableNames = cteColsMap.Keys.Concat(ddlTableNames).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
             // Extract CTE aliases first (before table extraction)
             var referencedAliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1425,16 +1413,18 @@ namespace ETL_rod787.Services
                 {
                     if (string.IsNullOrEmpty(s)) return false;
                     
-                    // Remove string literals (single-quoted and double-quoted) to avoid false positives
-                    // Handle both 'string' and "string" patterns, including escaped quotes
-                    // Match: '...' or "..." where ... can contain escaped quotes (\' or \")
-                    var withoutStringLiterals = Regex.Replace(s, @"(['""])(?:[^'""\\]|\\.)*\1", "");
+                    // Remove only single-quoted string literals to avoid false positives
+                    // In PostgreSQL: single quotes ('...') are string literals, double quotes ("...") are identifiers
+                    // Match: '...' where ... can contain escaped quotes (\')
+                    var withoutStringLiterals = Regex.Replace(s, @"'(?:[^'\\]|\\.)*'", "");
                     
                     // {%TOKEN%}
                     if (Regex.IsMatch(withoutStringLiterals, @"\{%.*?%\}")) return true;
-                    // @param or :param
+                    // @param (SQL Server parameter)
                     if (Regex.IsMatch(withoutStringLiterals, @"@[A-Za-z0-9_]+")) return true;
-                    if (Regex.IsMatch(withoutStringLiterals, @":[A-Za-z0-9_]+")) return true;
+                    // :param (Oracle/Named parameter) - but NOT :: (PostgreSQL type cast)
+                    // Use negative lookbehind to ensure : is not preceded by another :
+                    if (Regex.IsMatch(withoutStringLiterals, @"(?<!:):[A-Za-z0-9_]+")) return true;
                     // $1, $2 positional (but not inside string literals)
                     if (Regex.IsMatch(withoutStringLiterals, @"\$[0-9]+")) return true;
                     // JDBC-style ? (but not inside string literals)
