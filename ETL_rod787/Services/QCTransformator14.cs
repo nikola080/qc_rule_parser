@@ -40,6 +40,20 @@ namespace ETL_rod787.Services
 
         protected JsonArray qcRules = new();
 
+        // Schema-specific dictionaries: schema name -> dictionaries
+        protected Dictionary<string, Dictionary<string, string[]>> schemaTableColumns = 
+            new Dictionary<string, Dictionary<string, string[]>>(StringComparer.OrdinalIgnoreCase);
+        
+        protected Dictionary<string, Dictionary<string, string>> schemaColumnNameMaps = 
+            new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        
+        protected Dictionary<string, Dictionary<string, Dictionary<string, (string Schema, string Table, string Column)>>> schemaForeignKeyMaps = 
+            new Dictionary<string, Dictionary<string, Dictionary<string, (string, string, string)>>>(StringComparer.OrdinalIgnoreCase);
+        
+        protected Dictionary<string, Dictionary<string, string>> schemaColumnTypes = 
+            new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+        // Legacy single-schema dictionaries (for backward compatibility, populated from all schemas)
         protected Dictionary<string, string[]> table_columns = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
         private int expressionsStartRow;
@@ -47,12 +61,14 @@ namespace ETL_rod787.Services
 
         /// <summary>
         /// Column name mapping to CamelCase format used in DDL (lowercase -> CamelCase)
+        /// Merged from all schemas for backward compatibility
         /// </summary>
         protected Dictionary<string, string> ColumnNameMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Foreign key mapping based on DDL schema
         /// Maps table -> column -> (schema, table, column)
+        /// Merged from all schemas for backward compatibility
         /// </summary>
         protected Dictionary<string, Dictionary<string, (string Schema, string Table, string Column)>> ForeignKeyMap = 
             new Dictionary<string, Dictionary<string, (string, string, string)>>(StringComparer.OrdinalIgnoreCase);
@@ -62,6 +78,11 @@ namespace ETL_rod787.Services
         /// Example: { "dataset_93286": "rod14_wise6" }
         /// </summary>
         protected Dictionary<string, string> SchemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Column types dictionary (merged from all schemas for backward compatibility)
+        /// </summary>
+        protected Dictionary<string, string> _columnTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         public QCTransformator14(string path, string ddl, int expressionsStartRow, int expressionsEndRow, Dictionary<string, string>? schemaMap = null)
         {
@@ -97,7 +118,7 @@ namespace ETL_rod787.Services
 
         /// <summary>
         /// Parses DDL to extract table columns, column types, foreign keys, and column name mappings
-        /// Uses Microsoft.SqlServer.TransactSql.ScriptDom for proper parsing
+        /// Supports multiple schemas in a single DDL file
         /// </summary>
         private void ParseDdl(string ddl)
         {
@@ -107,11 +128,8 @@ namespace ETL_rod787.Services
                 return;
             }
 
-            // Dictionary to store column types (column name -> type)
-            var columnTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-            // Simple line-by-line parser for PostgreSQL DDL
-            // Extract columns directly from CREATE TABLE statements
+            // Track current schema being parsed
+            string currentSchema = null;
             string currentTable = null;
             var currentColumns = new List<string>();
             bool inTableDef = false;
@@ -128,14 +146,39 @@ namespace ETL_rod787.Services
                     continue;
                 }
                 
-                // Match CREATE TABLE
+                // Match CREATE SCHEMA to track schema boundaries
+                var schemaMatch = Regex.Match(trimmed, @"CREATE\s+SCHEMA\s+(?:(\w+)\.)?(?:""([^""]+)""|(\w+))", RegexOptions.IgnoreCase);
+                if (schemaMatch.Success)
+                {
+                    // Save previous table if any
+                    if (currentSchema != null && currentTable != null && currentColumns.Count > 0)
+                    {
+                        SaveTableToSchema(currentSchema, currentTable, currentColumns);
+                    }
+                    
+                    currentSchema = schemaMatch.Groups[2].Success ? schemaMatch.Groups[2].Value : schemaMatch.Groups[3].Value;
+                    currentTable = null;
+                    currentColumns = new List<string>();
+                    inTableDef = false;
+                    Console.WriteLine($"\nParsing schema: {currentSchema}");
+                    continue;
+                }
+                
+                // Match CREATE TABLE with optional schema prefix
                 var createMatch = Regex.Match(trimmed, @"CREATE\s+TABLE\s+(?:(\w+)\.)?(?:""([^""]+)""|(\w+))", RegexOptions.IgnoreCase);
                 if (createMatch.Success)
                 {
                     // Save previous table
-                    if (currentTable != null && currentColumns.Count > 0)
+                    if (currentSchema != null && currentTable != null && currentColumns.Count > 0)
                     {
-                        table_columns[currentTable] = currentColumns.ToArray();
+                        SaveTableToSchema(currentSchema, currentTable, currentColumns);
+                    }
+                    
+                    // Use schema from CREATE TABLE if specified, otherwise use current schema
+                    string tableSchema = createMatch.Groups[1].Success ? createMatch.Groups[1].Value : currentSchema;
+                    if (tableSchema != null)
+                    {
+                        currentSchema = tableSchema;
                     }
                     
                     currentTable = createMatch.Groups[2].Success ? createMatch.Groups[2].Value : createMatch.Groups[3].Value;
@@ -154,9 +197,9 @@ namespace ETL_rod787.Services
                 if (parenDepth <= 0 && trimmed.Contains(")"))
                 {
                     inTableDef = false;
-                    if (currentTable != null && currentColumns.Count > 0)
+                    if (currentSchema != null && currentTable != null && currentColumns.Count > 0)
                     {
-                        table_columns[currentTable] = currentColumns.ToArray();
+                        SaveTableToSchema(currentSchema, currentTable, currentColumns);
                     }
                     continue;
                 }
@@ -170,8 +213,26 @@ namespace ETL_rod787.Services
                         string colName = colMatch.Groups[1].Value.Trim();
                         string colType = colMatch.Groups[2].Value;
                         currentColumns.Add(colName);
-                        columnTypes[colName] = NormalizeColumnType(colType);
-                        ColumnNameMap[colName.ToLowerInvariant()] = colName;
+                        
+                        if (currentSchema != null)
+                        {
+                            // Store column type per schema
+                            if (!schemaColumnTypes.ContainsKey(currentSchema))
+                            {
+                                schemaColumnTypes[currentSchema] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                            }
+                            schemaColumnTypes[currentSchema][colName] = NormalizeColumnType(colType);
+                            
+                            // Store column name mapping per schema
+                            if (!schemaColumnNameMaps.ContainsKey(currentSchema))
+                            {
+                                schemaColumnNameMaps[currentSchema] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                            }
+                            schemaColumnNameMaps[currentSchema][colName.ToLowerInvariant()] = colName;
+                            
+                            // Also add to merged dictionary for backward compatibility
+                            ColumnNameMap[colName.ToLowerInvariant()] = colName;
+                        }
                     }
                 }
                 else if (!trimmed.StartsWith("CONSTRAINT", StringComparison.OrdinalIgnoreCase) && 
@@ -183,34 +244,55 @@ namespace ETL_rod787.Services
                         string colName = colMatch.Groups[1].Value.Trim();
                         string colType = colMatch.Groups[2].Value;
                         currentColumns.Add(colName);
-                        columnTypes[colName] = NormalizeColumnType(colType);
-                        ColumnNameMap[colName.ToLowerInvariant()] = colName;
+                        
+                        if (currentSchema != null)
+                        {
+                            // Store column type per schema
+                            if (!schemaColumnTypes.ContainsKey(currentSchema))
+                            {
+                                schemaColumnTypes[currentSchema] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                            }
+                            schemaColumnTypes[currentSchema][colName] = NormalizeColumnType(colType);
+                            
+                            // Store column name mapping per schema
+                            if (!schemaColumnNameMaps.ContainsKey(currentSchema))
+                            {
+                                schemaColumnNameMaps[currentSchema] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                            }
+                            schemaColumnNameMaps[currentSchema][colName.ToLowerInvariant()] = colName;
+                            
+                            // Also add to merged dictionary for backward compatibility
+                            ColumnNameMap[colName.ToLowerInvariant()] = colName;
+                        }
                     }
                 }
             }
             
             // Save last table
-            if (currentTable != null && currentColumns.Count > 0)
+            if (currentSchema != null && currentTable != null && currentColumns.Count > 0)
             {
-                table_columns[currentTable] = currentColumns.ToArray();
+                SaveTableToSchema(currentSchema, currentTable, currentColumns);
             }
             
             int CountChar(string str, char ch) => str.Count(c => c == ch);
             
-            Console.WriteLine($"\nTotal tables parsed: {table_columns.Count}");
-            foreach (var kvp in table_columns)
+            // Print summary per schema
+            Console.WriteLine($"\n=== DDL Parsing Summary ===");
+            foreach (var schemaKvp in schemaTableColumns)
             {
-                Console.WriteLine($"  {kvp.Key}: {kvp.Value.Length} columns");
+                Console.WriteLine($"\nSchema: {schemaKvp.Key}");
+                Console.WriteLine($"  Tables: {schemaKvp.Value.Count}");
+                foreach (var tableKvp in schemaKvp.Value)
+                {
+                    Console.WriteLine($"    {tableKvp.Key}: {tableKvp.Value.Length} columns");
+                }
             }
             
-            Console.WriteLine($"\nColumnNameMap entries (sample):");
-            foreach (var kvp in ColumnNameMap.Take(10))
-            {
-                Console.WriteLine($"  '{kvp.Key}' -> '{kvp.Value}'");
-            }
-            Console.WriteLine($"  ... (total: {ColumnNameMap.Count} entries)");
+            // Print merged summary for backward compatibility
+            Console.WriteLine($"\nTotal tables parsed (merged): {table_columns.Count}");
+            Console.WriteLine($"Total columns (merged): {ColumnNameMap.Count}");
 
-            // Parse ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY statements
+            // Parse ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY statements (schema-aware)
             // Pattern: ALTER TABLE [schema.]"table" ADD CONSTRAINT name FOREIGN KEY ("column") REFERENCES [schema.]"table"("column")
             // Updated pattern to handle composite foreign keys: FOREIGN KEY ("col1",col2) REFERENCES ...
             var fkPattern = new Regex(@"ALTER\s+TABLE\s+(?:(\w+)\.)?(?:""([^""]+)""|(\w+))\s+ADD\s+CONSTRAINT\s+[^\s]+\s+FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+(?:(\w+)\.)?(?:""([^""]+)""|(\w+))\s*\(([^)]+)\)", RegexOptions.IgnoreCase);
@@ -235,17 +317,59 @@ namespace ETL_rod787.Services
                     string sourceColumn = sourceColMatch.Groups[1].Success ? sourceColMatch.Groups[1].Value : sourceColMatch.Groups[2].Value;
                     string targetColumn = targetColMatch.Groups[1].Success ? targetColMatch.Groups[1].Value : targetColMatch.Groups[2].Value;
                     
+                    // Store foreign key per schema
+                    if (!string.IsNullOrEmpty(sourceSchema))
+                    {
+                        if (!schemaForeignKeyMaps.ContainsKey(sourceSchema))
+                        {
+                            schemaForeignKeyMaps[sourceSchema] = new Dictionary<string, Dictionary<string, (string, string, string)>>(StringComparer.OrdinalIgnoreCase);
+                        }
+                        if (!schemaForeignKeyMaps[sourceSchema].ContainsKey(sourceTable))
+                        {
+                            schemaForeignKeyMaps[sourceSchema][sourceTable] = new Dictionary<string, (string, string, string)>(StringComparer.OrdinalIgnoreCase);
+                        }
+                        schemaForeignKeyMaps[sourceSchema][sourceTable][sourceColumn] = (targetSchema, targetTable, targetColumn);
+                    }
+                    
+                    // Also store in merged dictionary for backward compatibility
                     if (!ForeignKeyMap.ContainsKey(sourceTable))
                     {
                         ForeignKeyMap[sourceTable] = new Dictionary<string, (string, string, string)>(StringComparer.OrdinalIgnoreCase);
                     }
-                    
                     ForeignKeyMap[sourceTable][sourceColumn] = (targetSchema, targetTable, targetColumn);
                 }
             }
 
             // Store column types in a protected field for QCTransformatorMSSQL to access
-            _columnTypes = columnTypes;
+            // Merge all schema column types into a single dictionary for backward compatibility
+            _columnTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var schemaTypes in schemaColumnTypes.Values)
+            {
+                foreach (var kvp in schemaTypes)
+                {
+                    _columnTypes[kvp.Key] = kvp.Value;
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Helper method to save table information to schema-specific dictionaries
+        /// </summary>
+        private void SaveTableToSchema(string schema, string tableName, List<string> columns)
+        {
+            if (string.IsNullOrEmpty(schema)) return;
+            
+            // Initialize schema dictionaries if needed
+            if (!schemaTableColumns.ContainsKey(schema))
+            {
+                schemaTableColumns[schema] = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+            }
+            
+            // Save table columns per schema
+            schemaTableColumns[schema][tableName] = columns.ToArray();
+            
+            // Also save to merged dictionary for backward compatibility
+            table_columns[tableName] = columns.ToArray();
         }
 
         /// <summary>
@@ -282,11 +406,6 @@ namespace ETL_rod787.Services
             
             return typeLower;
         }
-
-        /// <summary>
-        /// Column types dictionary (protected for QCTransformatorMSSQL access)
-        /// </summary>
-        protected Dictionary<string, string> _columnTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         // visitor to collect references across script
         private class ReferenceCollector : TSqlFragmentVisitor
@@ -363,13 +482,68 @@ namespace ETL_rod787.Services
         }
 
         /// <summary>
-        /// Detects if the SQL query is already in PostgreSQL format by attempting to parse it with SQL Server parser.
-        /// Uses Microsoft.SqlServer.TransactSql.ScriptDom to determine if the query is NOT SQL Server syntax.
-        /// If SQL Server parser cannot parse it, it's likely PostgreSQL.
+        /// Detects if the SQL query is already in PostgreSQL format by checking for SQL Server-specific functions and keywords.
+        /// If SQL Server-specific functions are found, it's definitely SQL Server, not PostgreSQL.
+        /// Otherwise, attempts to parse with SQL Server parser to determine dialect.
         /// </summary>
         protected bool IsPostgresQuery(string sql)
         {
             if (string.IsNullOrEmpty(sql)) return false;
+            
+            // Check for SQL Server-specific functions - if found, it's definitely SQL Server, not PostgreSQL
+            var sqlServerFunctions = new[]
+            {
+                @"\bISNUMERIC\s*\(",
+                @"\bISDATE\s*\(",
+                @"\bGETDATE\s*\(",
+                @"\bISNULL\s*\(",
+                @"\bTOP\s+\d+",  // TOP n (SQL Server) vs LIMIT n (PostgreSQL)
+                @"\bDATEPART\s*\(",
+                @"\bDATEDIFF\s*\(",
+                @"\bDATEADD\s*\(",
+                @"\bLEN\s*\(",  // SQL Server LEN vs PostgreSQL LENGTH
+                @"\bSUBSTRING\s*\([^,]+,\s*\d+\s*,\s*\d+",  // SQL Server SUBSTRING(expr, start, length) vs PostgreSQL SUBSTRING(expr FROM start FOR length)
+                @"\[.*?\]",  // Square brackets for identifiers (SQL Server) vs double quotes (PostgreSQL)
+            };
+            
+            foreach (var pattern in sqlServerFunctions)
+            {
+                if (Regex.IsMatch(sql, pattern, RegexOptions.IgnoreCase))
+                {
+                    return false; // Definitely SQL Server
+                }
+            }
+            
+            // Check for PostgreSQL-specific functions/features - if found, likely PostgreSQL
+            var postgresFunctions = new[]
+            {
+                @"\bREGEXP_LIKE\s*\(",
+                @"\bREGEXP_MATCHES\s*\(",
+                @"\bREGEXP_REPLACE\s*\(",
+                @"\bTO_DATE\s*\(",
+                @"\bTO_TIMESTAMP\s*\(",
+                @"\bEXTRACT\s*\(",
+                @"\bDATE_PART\s*\(",
+                @"::\s*(text|int|numeric|date|timestamp)",  // PostgreSQL type casting syntax
+                @"\bLIMIT\s+\d+",  // PostgreSQL LIMIT vs SQL Server TOP
+                @"\bILIKE\s+",  // PostgreSQL case-insensitive LIKE
+            };
+            
+            bool hasPostgresFeatures = false;
+            foreach (var pattern in postgresFunctions)
+            {
+                if (Regex.IsMatch(sql, pattern, RegexOptions.IgnoreCase))
+                {
+                    hasPostgresFeatures = true;
+                    break;
+                }
+            }
+            
+            // If it has PostgreSQL features but no SQL Server features, it's likely PostgreSQL
+            if (hasPostgresFeatures)
+            {
+                return true;
+            }
             
             // Fix standalone ISNUMERIC before testing (in case it's SQL Server with missing = 1)
             var testSql = FixStandaloneIsNumeric(sql);
@@ -434,8 +608,17 @@ namespace ETL_rod787.Services
             }
         }
 
-        protected SqlAnalysisResult AnalyzeSql(string sql)
+        protected SqlAnalysisResult AnalyzeSql(string sql, System.Text.StringBuilder? debugOutput = null)
         {
+            void DebugWriteLine(string message)
+            {
+                if (debugOutput != null)
+                {
+                    debugOutput.AppendLine(message);
+                }
+                Console.WriteLine(message);
+            }
+
             var result = new SqlAnalysisResult();
 
             // Fix standalone ISNUMERIC expressions BEFORE parsing to ensure parser receives valid SQL
@@ -464,7 +647,7 @@ namespace ETL_rod787.Services
                     {
                         // Cannot parse with SQL Server parser - likely PostgreSQL
                         // Analyze PostgreSQL query using regex-based extraction
-                        return AnalyzePostgresSql(sql);
+                        return AnalyzePostgresSql(sql, debugOutput);
                     }
                     // Fallback succeeded, use it
                     tree = treeOrig as TSqlScript;
@@ -473,7 +656,7 @@ namespace ETL_rod787.Services
                 catch
                 {
                     // Parse exception - likely PostgreSQL, analyze as PostgreSQL
-                    return AnalyzePostgresSql(sql);
+                    return AnalyzePostgresSql(sql, debugOutput);
                 }
             }
 
@@ -735,8 +918,17 @@ namespace ETL_rod787.Services
         /// Analyzes PostgreSQL SQL queries using regex-based extraction since we can't use SQL Server parser.
         /// Extracts and validates schema names, table names, and column names.
         /// </summary>
-        protected SqlAnalysisResult AnalyzePostgresSql(string sql)
+        protected SqlAnalysisResult AnalyzePostgresSql(string sql, System.Text.StringBuilder? debugOutput = null)
         {
+            void DebugWriteLine(string message)
+            {
+                if (debugOutput != null)
+                {
+                    debugOutput.AppendLine(message);
+                }
+                Console.WriteLine(message);
+            }
+
             var result = new SqlAnalysisResult();
             
             if (string.IsNullOrEmpty(sql)) return result;
@@ -806,12 +998,19 @@ namespace ETL_rod787.Services
                 var ctesSection = sql.Substring(ctesStart, ctesEnd - ctesStart);
                 
                 // Extract individual CTEs - handle nested parentheses and commas between CTEs
-                var cteNamePattern = @"(?:^|,)\s*(\w+)\s+AS\s*\(";
+                // Pattern: match CTE name (can be quoted or unquoted, can contain underscores and numbers)
+                // Matches: CTE_12422_dataflowmetadata AS ( or "CTE_12422_dataflowmetadata" AS ( or ,CTE_12422_dataflowmetadata AS (
+                // First CTE after WITH doesn't have comma, so match start of string OR comma
+                var cteNamePattern = @"(?:^|,)\s*(?:""?([^""\s,()]+)""?|([a-zA-Z_][a-zA-Z0-9_]*))\s+AS\s*\(";
                 var cteNameMatches = Regex.Matches(ctesSection, cteNamePattern, RegexOptions.IgnoreCase | RegexOptions.Multiline);
                 
                 foreach (Match cteNameMatch in cteNameMatches)
                 {
-                    var cteName = cteNameMatch.Groups[1].Value;
+                    // Get CTE name from either group (quoted or unquoted)
+                    var cteName = cteNameMatch.Groups[1].Success ? cteNameMatch.Groups[1].Value : 
+                                  cteNameMatch.Groups[2].Success ? cteNameMatch.Groups[2].Value : 
+                                  cteNameMatch.Groups[0].Value;
+                    cteName = cteName.Trim('"', ' ');
                     var startPos = cteNameMatch.Index + cteNameMatch.Length;
                     var parenDepth2 = 1;
                     var endPos = startPos;
@@ -885,8 +1084,15 @@ namespace ETL_rod787.Services
                         
                         cteColsMap[cteName] = cols;
                         cteList.Add(new CteBlock { Name = cteName, Query = cteQuery });
+                        DebugWriteLine($"[DEBUG AnalyzePostgresSql] Extracted CTE: '{cteName}' with columns: {string.Join(", ", cols)}");
                     }
                 }
+            }
+            
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Total CTEs extracted: {cteColsMap.Count}");
+            foreach (var kvp in cteColsMap)
+            {
+                DebugWriteLine($"[DEBUG AnalyzePostgresSql] CTE '{kvp.Key}' -> columns: {string.Join(", ", kvp.Value)}");
             }
 
             var cteColumnsAll = cteColsMap.SelectMany(kv => kv.Value).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -898,10 +1104,26 @@ namespace ETL_rod787.Services
             var tableNames = cteColsMap.Keys.Concat(ddlTableNames).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
             // Extract CTE aliases first (before table extraction)
+            // Also extract CTE names from the SQL directly to catch any that might have been missed
             var referencedAliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var cteName in cteColsMap.Keys)
             {
                 referencedAliases.Add(cteName);
+            }
+            
+            // Also extract CTE names directly from SQL to ensure we catch all of them
+            // Pattern: WITH cteName AS ( or , cteName AS ( or WITH "cteName" AS (
+            var directCtePattern = @"(?:WITH|,)\s+(?:""?([^""\s,()]+)""?|(\w+))\s+AS\s*\(";
+            var directCteMatches = Regex.Matches(sql, directCtePattern, RegexOptions.IgnoreCase);
+            foreach (Match cteMatch in directCteMatches)
+            {
+                var cteName = cteMatch.Groups[1].Success ? cteMatch.Groups[1].Value : 
+                              cteMatch.Groups[2].Success ? cteMatch.Groups[2].Value : "";
+                cteName = cteName.Trim('"', ' ');
+                if (!string.IsNullOrEmpty(cteName))
+                {
+                    referencedAliases.Add(cteName);
+                }
             }
 
             // Extract schema.table.column references using regex
@@ -909,26 +1131,92 @@ namespace ETL_rod787.Services
             var referencedTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var referencedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            // First, find all function calls and mark their arguments as non-table contexts
+            // This prevents matching FROM inside EXTRACT(YEAR FROM "column")
+            var functionCallPattern = @"\b(EXTRACT|TO_DATE|CAST|SUBSTRING|POSITION|CONCAT|REGEXP_LIKE|REGEXP_MATCHES|ISDATE|COALESCE|ISNULL|GETDATE|YEAR|MONTH|DAY|DATE_PART)\s*\(";
+            var functionMatches = Regex.Matches(sql, functionCallPattern, RegexOptions.IgnoreCase);
+            var functionArgRangesForTables = new List<Tuple<int, int>>();
+            
+            foreach (Match funcMatch in functionMatches)
+            {
+                int startPos = funcMatch.Index;
+                int parenDepth = 1;
+                int endPos = startPos + funcMatch.Length;
+                
+                // Find matching closing parenthesis, handling string literals
+                bool inString = false;
+                char stringDelimiter = '\0';
+                while (endPos < sql.Length && parenDepth > 0)
+                {
+                    char ch = sql[endPos];
+                    if (!inString && (ch == '\'' || ch == '"'))
+                    {
+                        inString = true;
+                        stringDelimiter = ch;
+                    }
+                    else if (inString && ch == stringDelimiter)
+                    {
+                        if (endPos + 1 < sql.Length && sql[endPos + 1] == stringDelimiter)
+                        {
+                            endPos++; // Skip escaped quote
+                        }
+                        else
+                        {
+                            inString = false;
+                            stringDelimiter = '\0';
+                        }
+                    }
+                    else if (!inString)
+                    {
+                        if (ch == '(') parenDepth++;
+                        else if (ch == ')') parenDepth--;
+                    }
+                    endPos++;
+                }
+                
+                if (parenDepth == 0)
+                {
+                    functionArgRangesForTables.Add(new Tuple<int, int>(startPos, endPos - 1));
+                }
+            }
+
             // Pattern for schema.table or table references
             // Matches: schema."table", "schema"."table", schema.[table], [table], table, "table"
-            // Exclude CTE names from being extracted as tables
+            // IMPORTANT: Only match FROM/JOIN that are NOT inside function calls
             var tableRefPattern = @"(?:FROM|JOIN)\s+(?:(?:(\w+|""[^""]+"")\.)?(\[?(\w+)\]?|""([^""]+)""))";
             var tableMatches = Regex.Matches(sql, tableRefPattern, RegexOptions.IgnoreCase);
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found {tableMatches.Count} potential table references in FROM/JOIN");
             foreach (Match match in tableMatches)
             {
+                // Skip if this FROM/JOIN is inside a function call
+                bool isInFunction = functionArgRangesForTables.Any(range => match.Index >= range.Item1 && match.Index <= range.Item2);
+                if (isInFunction)
+                {
+                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Skipped table match at position {match.Index} - inside function call");
+                    continue;
+                }
+
                 if (match.Groups[1].Success)
                 {
                     var schema = match.Groups[1].Value.Trim('"');
                     referencedSchemas.Add(schema);
+                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found schema: '{schema}'");
                 }
                 var table = match.Groups[3].Success ? match.Groups[3].Value : 
                            match.Groups[4].Success ? match.Groups[4].Value : 
                            match.Groups[2].Value.Trim('[', ']', '"');
                 
+                DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found table reference: '{table}' (is CTE: {referencedAliases.Contains(table)})");
+                
                 // Skip CTE names - they're already in referencedAliases
                 if (!referencedAliases.Contains(table))
                 {
                     referencedTables.Add(table);
+                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added '{table}' to referencedTables");
+                }
+                else
+                {
+                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Skipped '{table}' - it's a CTE");
                 }
             }
 
@@ -937,11 +1225,11 @@ namespace ETL_rod787.Services
             // Only match quoted identifiers that appear in column contexts (not function arguments)
             
             // First, find all function calls and mark their arguments as non-columns
-            var functionCallPattern = @"\b(SUBSTRING|POSITION|CONCAT|CAST|EXTRACT|YEAR|TO_DATE|REGEXP_LIKE|REGEXP_MATCHES|ISDATE|COALESCE|ISNULL|GETDATE)\s*\(";
-            var functionMatches = Regex.Matches(sql, functionCallPattern, RegexOptions.IgnoreCase);
+            var functionCallPatternForColumns = @"\b(SUBSTRING|POSITION|CONCAT|CAST|EXTRACT|YEAR|TO_DATE|REGEXP_LIKE|REGEXP_MATCHES|ISDATE|COALESCE|ISNULL|GETDATE)\s*\(";
+            var functionMatchesForColumns = Regex.Matches(sql, functionCallPatternForColumns, RegexOptions.IgnoreCase);
             var functionArgRanges = new List<Tuple<int, int>>();
             
-            foreach (Match funcMatch in functionMatches)
+            foreach (Match funcMatch in functionMatchesForColumns)
             {
                 int startPos = funcMatch.Index + funcMatch.Length;
                 int parenDepth = 1;
@@ -983,12 +1271,13 @@ namespace ETL_rod787.Services
                     continue;
                 }
                 
-                // Skip SQL keywords, function names, numeric literals, boolean literals, and CTE names
+                // Skip SQL keywords, function names, numeric literals, boolean literals, CTE names, and TABLE NAMES
                 if (string.IsNullOrEmpty(column) || 
                     sqlKeywords.Contains(column.ToUpper()) ||
                     Regex.IsMatch(column, numericPattern) ||
                     booleanLiterals.Contains(column) ||
-                    referencedAliases.Contains(column))
+                    referencedAliases.Contains(column) ||
+                    referencedTables.Contains(column)) // Exclude table names from columns
                 {
                     continue;
                 }
@@ -1030,13 +1319,36 @@ namespace ETL_rod787.Services
             }
 
             // Exclude CTE names from unknown tables check
-            var unknownTables = referencedTables.Where(t => !allowedTables.Contains(t) && !referencedAliases.Contains(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            // Also check if table name matches any CTE name (case-insensitive)
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking unknown tables. referencedTables: {string.Join(", ", referencedTables)}");
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] allowedTables (first 10): {string.Join(", ", allowedTables.Take(10))}...");
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] referencedAliases (CTEs): {string.Join(", ", referencedAliases)}");
+            var unknownTables = referencedTables.Where(t => 
+                !allowedTables.Contains(t) && 
+                !referencedAliases.Contains(t) &&
+                !cteColsMap.Keys.Any(cte => cte.Equals(t, StringComparison.OrdinalIgnoreCase)))
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] unknownTables result: {string.Join(", ", unknownTables)}");
+            
             // Exclude CTE names from unknown columns check
-            var unknownColumns = referencedColumns.Where(c => !allowedColumns.Contains(c) && !referencedAliases.Contains(c)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            // Also check if column name matches any CTE name (case-insensitive) - CTEs can be used as table aliases
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking unknown columns. referencedColumns (first 10): {string.Join(", ", referencedColumns.Take(10))}...");
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] allowedColumns (first 10): {string.Join(", ", allowedColumns.Take(10))}...");
+            var unknownColumns = referencedColumns.Where(c => 
+                !allowedColumns.Contains(c) && 
+                !referencedAliases.Contains(c) &&
+                !cteColsMap.Keys.Any(cte => cte.Equals(c, StringComparison.OrdinalIgnoreCase)))
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] unknownColumns result: {string.Join(", ", unknownColumns)}");
+            
             // Check against SchemaMap keys (source schemas) and values (target schemas)
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking schemas. referencedSchemas: {string.Join(", ", referencedSchemas)}");
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] SchemaMap keys: {string.Join(", ", SchemaMap.Keys)}");
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] SchemaMap values: {string.Join(", ", SchemaMap.Values)}");
             var nonDatasetSchemas = referencedSchemas.Where(s => 
                 !SchemaMap.ContainsKey(s) && !SchemaMap.Values.Contains(s, StringComparer.OrdinalIgnoreCase))
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] nonDatasetSchemas result: {string.Join(", ", nonDatasetSchemas)}");
 
             result.Ctes = cteList;
             result.UnknownTables = unknownTables;
@@ -1396,6 +1708,14 @@ namespace ETL_rod787.Services
             var outputs = new List<(int Row, string Original, string Transformed)>();
             if (workbook == null) return outputs;
 
+            // Create debug output file
+            var debugOutput = new System.Text.StringBuilder();
+            void DebugWriteLine(string message)
+            {
+                debugOutput.AppendLine(message);
+                Console.WriteLine(message); // Also write to console
+            }
+
             var sheet = workbook.GetSheetAt(0);
             for (int r = expressionsStartRow; r <= expressionsEndRow; r++)
             {
@@ -1434,27 +1754,37 @@ namespace ETL_rod787.Services
 
                 if (IsParameterized(expr))
                 {
-                    Console.WriteLine($"Row {r}: ERROR: contains parameter/template tokens");
+                    DebugWriteLine($"Row {r}: ERROR: contains parameter/template tokens");
                     continue;
                 }
 
                 SqlAnalysisResult analysis;
                 try
                 {
-                    analysis = AnalyzeSql(expr);
+                    analysis = AnalyzeSql(expr, debugOutput);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error parsing expression at row {r}: {ex.Message}");
+                    DebugWriteLine($"Error parsing expression at row {r}: {ex.Message}");
                     continue;
                 }
 
                 if (analysis.ParseErrors != null && analysis.ParseErrors.Length > 0)
                 {
                     var msg = string.Join("; ", analysis.ParseErrors);
-                    Console.WriteLine($"Row {r}: ERROR: {msg}");
+                    DebugWriteLine($"Row {r}: ERROR: {msg}");
                     continue;
                 }
+
+                // DEBUG: Print analysis results
+                DebugWriteLine($"\n=== DEBUG Row {r} ===");
+                DebugWriteLine($"CTEs found: {string.Join(", ", analysis.Ctes?.Select(c => c.Name) ?? new string[0])}");
+                DebugWriteLine($"UnknownTables: {string.Join(", ", analysis.UnknownTables ?? new string[0])}");
+                DebugWriteLine($"UnknownColumns: {string.Join(", ", analysis.UnknownColumns ?? new string[0])}");
+                DebugWriteLine($"NonDatasetSchemas: {string.Join(", ", analysis.NonDatasetSchemas ?? new string[0])}");
+                DebugWriteLine($"TableNames (allowed): {string.Join(", ", analysis.TableNames?.Take(10) ?? new string[0])}...");
+                DebugWriteLine($"AllTempColumns (allowed): {string.Join(", ", analysis.AllTempColumns?.Take(10) ?? new string[0])}...");
+                DebugWriteLine($"===================\n");
 
                 if (analysis.UnknownTables.Length == 0 && analysis.UnknownColumns.Length == 0 && analysis.NonDatasetSchemas.Length == 0)
                 {
@@ -1477,9 +1807,13 @@ namespace ETL_rod787.Services
                     if (analysis.UnknownColumns.Length > 0) parts.Add($"unknown columns: {string.Join(',', analysis.UnknownColumns)}");
                     if (analysis.NonDatasetSchemas.Length > 0) parts.Add($"non-dataset schemas: {string.Join(',', analysis.NonDatasetSchemas)}");
                     var msg = parts.Count == 0 ? "unknown references" : string.Join("; ", parts);
-                    Console.WriteLine($"Row {r}: ERROR: {msg}");
+                    DebugWriteLine($"Row {r}: ERROR: {msg}");
                 }
             }
+
+            // Write debug output to file
+            File.WriteAllText("output_debugg.txt", debugOutput.ToString());
+            Console.WriteLine($"Debug output written to output_debugg.txt");
 
             return outputs;
         }
@@ -1696,23 +2030,29 @@ namespace ETL_rod787.Services
                     string descriptionLower = description.ToLowerInvariant();
                     
                     // Check for UNIQUE constraint
-                    if (descriptionLower.Contains("unique") && descriptionLower.Contains("within the table"))
+                    // Pattern: "Checks if ColumnX, ColumnY, and ColumnZ are unique(s) within (the) table"
+                    if (descriptionLower.StartsWith("checks if ") && (descriptionLower.Contains("unique") && descriptionLower.Contains("within")))
                     {
                         // Extract column names from description
-                        // Pattern: "Checks if ColumnX, ColumnY, etc.. are unique within the table"
                         operatorCode = "UNIQUE";
                         ruleLevel = "ROW";
                         columnName = null; // Set to NULL for ROW-level rules
                         
                         // Extract column names from description
-                        // Look for pattern like "waterBodyIdentifier, waterBodyIdentifierScheme, ..."
+                        // Pattern: "Checks if col1, col2, col3 and col4 are uniques within table"
                         var columnNames = new List<string>();
                         
-                        // Try to extract from description - look for text between "if" and "are unique"
-                        var uniqueMatch = Regex.Match(description, @"if\s+(.+?)\s+are\s+unique", RegexOptions.IgnoreCase);
+                        // Try to extract from description - look for text between "Checks if " and " are unique"
+                        // Handle both "are unique" and "are uniques" (plural)
+                        var uniqueMatch = Regex.Match(description, @"checks\s+if\s+(.+?)\s+are\s+uniques?\s+within", RegexOptions.IgnoreCase);
                         if (uniqueMatch.Success)
                         {
                             string columnsText = uniqueMatch.Groups[1].Value;
+                            
+                            // Split by comma and "and" - handle patterns like "col1, col2, col3 and col4"
+                            // Replace " and " with "," to normalize
+                            columnsText = Regex.Replace(columnsText, @"\s+and\s+", ", ", RegexOptions.IgnoreCase);
+                            
                             // Split by comma and clean up
                             var cols = columnsText.Split(',')
                                 .Select(c => c.Trim())
@@ -1750,19 +2090,19 @@ namespace ETL_rod787.Services
                             }
                             else
                             {
-                                Console.WriteLine($"Skipping row {r}: Could not extract column names from UNIQUE description");
+                                Console.WriteLine($"Skipping row {r}: Could not extract column names from UNIQUE description: {description}");
                                 continue;
                             }
                         }
                         
-                        // Create JSON with columns array
+                        // Create JSON with "unique" key containing columns array
                         var jsonObject = new JsonObject();
                         var columnsArray = new JsonArray();
                         foreach (var col in columnNames)
                         {
                             columnsArray.Add(col);
                         }
-                        jsonObject["columns"] = columnsArray;
+                        jsonObject["unique"] = columnsArray;
                         jsonString = jsonObject.ToJsonString();
                     }
                 else if (descriptionLower.Contains("missing or empty") || descriptionLower.Contains("field is missing"))
