@@ -42,8 +42,8 @@ namespace ETL_rod787.Services
 
         protected Dictionary<string, string[]> table_columns = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
-        private int expressionsStartRow = 106;
-        private int expressionsEndRow = 214;
+        private int expressionsStartRow;
+        private int expressionsEndRow;
 
         /// <summary>
         /// Column name mapping to CamelCase format used in DDL (lowercase -> CamelCase)
@@ -63,7 +63,7 @@ namespace ETL_rod787.Services
         /// </summary>
         protected Dictionary<string, string> SchemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        public QCTransformator14(string path, string ddl, Dictionary<string, string>? schemaMap = null, int expressionsStartRow = 106, int expressionsEndRow = 214)
+        public QCTransformator14(string path, string ddl, int expressionsStartRow, int expressionsEndRow, Dictionary<string, string>? schemaMap = null)
         {
             try
             {

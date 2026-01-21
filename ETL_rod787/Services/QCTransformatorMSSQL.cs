@@ -76,7 +76,8 @@ namespace ETL_rod787.Services
         // Column type dictionary - uses instance dictionary from base class
         protected Dictionary<string, string> ColumnTypes => _columnTypes;
 
-        public QCTransformatorMSSQL(string path, string ddl, Dictionary<string, string>? schemaMap = null) : base(path, ddl, schemaMap)
+        public QCTransformatorMSSQL(string path, string ddl, int expressionsStartRow, int expressionsEndRow, Dictionary<string, string>? schemaMap = null) 
+            : base(path, ddl, expressionsStartRow, expressionsEndRow, schemaMap)
         {
         }
 

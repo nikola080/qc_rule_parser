@@ -7,17 +7,20 @@ using System.IO;
 string ddl = File.ReadAllText("ddl.sql"); // Or provide DDL string directly
 
 // Define schema name mapping
-/*var schemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-{
-    { "dataset_93286", "rod14_wise6" }
-};*/
 var schemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 {
-    { "dataset_96269", "rod787" }
+    { "dataset_93286", "rod14_wise6" }
 };
+/*var schemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+{
+    { "dataset_96269", "rod787" }
+};*/
 
 Console.WriteLine("DDL: ", ddl);
-var transformer = new QCTransformatorMSSQL("C:/Users/Korisnik/Desktop/nikola/rod787/QC_Rules.xlsx", ddl, schemaMap);
+// Set row boundaries for Excel processing
+int expressionsStartRow = 3;  // Set your starting row number here
+int expressionsEndRow = 299;    // Set your ending row number here
+var transformer = new QCTransformatorMSSQL("C:/Users/Korisnik/Desktop/nikola/rod14/QC_rules_colored_by_type.xlsx", ddl, expressionsStartRow, expressionsEndRow, schemaMap);
 var transformed = transformer.ProcessExpressionsFromExcel();
 
 foreach (var item in transformed)
