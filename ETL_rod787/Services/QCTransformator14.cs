@@ -472,6 +472,18 @@ namespace ETL_rod787.Services
 
                 base.Visit(node);
             }
+
+            public override void Visit(QueryDerivedTable node)
+            {
+                if (node == null) return;
+                // QueryDerivedTable represents subqueries in FROM/JOIN like: FROM (SELECT ...) AS alias
+                if (node.Alias != null && !string.IsNullOrEmpty(node.Alias.Value))
+                {
+                    Aliases[node.Alias.Value] = "subquery";
+                    // Don't add to Tables - it's an alias, not a real table
+                }
+                base.Visit(node);
+            }
         }
 
         public virtual List<CteBlock> parseSQL(string sql)
@@ -890,14 +902,28 @@ namespace ETL_rod787.Services
                 }
             }
 
+            // Remove aliases from referencedTables - they're not real tables
+            // Column references like R."column" add R to Tables, but if R is an alias, it shouldn't be in referencedTables
+            referencedTables.RemoveWhere(t => referencedAliases.Contains(t));
+            
+            DebugWriteLine($"[DEBUG AnalyzeSql] referencedAliases: {string.Join(", ", referencedAliases)}");
+            DebugWriteLine($"[DEBUG AnalyzeSql] referencedTables after removing aliases: {string.Join(", ", referencedTables)}");
+
             var allowedTables = new HashSet<string>(tableNames, StringComparer.OrdinalIgnoreCase);
-            foreach (var a in referencedAliases) allowedTables.Add(a);
+            foreach (var a in referencedAliases) 
+            {
+                allowedTables.Add(a);
+                DebugWriteLine($"[DEBUG AnalyzeSql] Added alias '{a}' to allowedTables");
+            }
 
             var allowedColumns = new HashSet<string>(tempColumns, StringComparer.OrdinalIgnoreCase);
             foreach (var a in topLevelSelectAliases) allowedColumns.Add(a);
             allowedColumns.Add("record_id");
 
+            DebugWriteLine($"[DEBUG AnalyzeSql] Checking unknown tables. referencedTables: {string.Join(", ", referencedTables)}");
+            DebugWriteLine($"[DEBUG AnalyzeSql] allowedTables (first 10): {string.Join(", ", allowedTables.Take(10))}...");
             var unknownTables = referencedTables.Where(t => !allowedTables.Contains(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            DebugWriteLine($"[DEBUG AnalyzeSql] unknownTables result: {string.Join(", ", unknownTables)}");
             var unknownColumns = referencedColumns.Where(c => !allowedColumns.Contains(c)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             // Check against SchemaMap keys (source schemas) and values (target schemas)
             var nonDatasetSchemas = referencedSchemas.Where(s => 
@@ -1125,6 +1151,117 @@ namespace ETL_rod787.Services
                     referencedAliases.Add(cteName);
                 }
             }
+            
+            // Extract subquery aliases from JOIN clauses
+            // Pattern: JOIN (...) AS alias or JOIN (...) alias or JOIN (SELECT ...) AS "alias"
+            // Need to handle nested parentheses properly
+            var joinSubqueryPattern = @"(?:INNER\s+)?(?:LEFT|RIGHT|FULL\s+)?JOIN\s+\(";
+            var joinSubqueryMatches = Regex.Matches(sql, joinSubqueryPattern, RegexOptions.IgnoreCase);
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found {joinSubqueryMatches.Count} JOIN subquery patterns");
+            foreach (Match joinMatch in joinSubqueryMatches)
+            {
+                int startPos = joinMatch.Index + joinMatch.Length;
+                int parenDepth = 1;
+                int endPos = startPos;
+                
+                // Find matching closing parenthesis, handling string literals
+                bool inString = false;
+                char stringDelimiter = '\0';
+                while (endPos < sql.Length && parenDepth > 0)
+                {
+                    char ch = sql[endPos];
+                    if (!inString && (ch == '\'' || ch == '"'))
+                    {
+                        inString = true;
+                        stringDelimiter = ch;
+                    }
+                    else if (inString && ch == stringDelimiter)
+                    {
+                        if (endPos + 1 < sql.Length && sql[endPos + 1] == stringDelimiter)
+                        {
+                            endPos++; // Skip escaped quote
+                        }
+                        else
+                        {
+                            inString = false;
+                            stringDelimiter = '\0';
+                        }
+                    }
+                    else if (!inString)
+                    {
+                        if (ch == '(') parenDepth++;
+                        else if (ch == ')') parenDepth--;
+                    }
+                    endPos++;
+                }
+                
+                if (parenDepth == 0)
+                {
+                    // Found closing parenthesis, now look for alias after it
+                    // Look ahead up to 50 characters for "AS alias" or just "alias"
+                    int searchEnd = Math.Min(endPos + 50, sql.Length);
+                    string afterParen = sql.Substring(endPos, searchEnd - endPos);
+                    
+                    // Pattern: optional whitespace, optional "AS", whitespace, then alias (word or quoted)
+                    var aliasMatch = Regex.Match(afterParen, @"\s+(?:AS\s+)?(?:""([^""]+)""|(\w+))", RegexOptions.IgnoreCase);
+                    if (aliasMatch.Success)
+                    {
+                        string alias = aliasMatch.Groups[1].Success ? aliasMatch.Groups[1].Value : 
+                                      aliasMatch.Groups[2].Success ? aliasMatch.Groups[2].Value : "";
+                        
+                        if (!string.IsNullOrEmpty(alias) && 
+                            !Regex.IsMatch(alias, @"^(ON|WHERE|GROUP|ORDER|HAVING|AND|OR|INNER|LEFT|RIGHT|FULL|CROSS)$", RegexOptions.IgnoreCase))
+                        {
+                            referencedAliases.Add(alias);
+                            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found subquery alias in JOIN: '{alias}' at position {endPos + aliasMatch.Index}");
+                        }
+                    }
+                    else
+                    {
+                        DebugWriteLine($"[DEBUG AnalyzePostgresSql] No alias found after JOIN subquery at position {endPos}, text: '{afterParen.Substring(0, Math.Min(30, afterParen.Length))}'");
+                    }
+                }
+            }
+            
+            // Also extract table aliases from FROM/JOIN (for regular tables, not just subqueries)
+            // Pattern: FROM table AS alias or FROM table alias or JOIN table AS alias
+            var tableAliasPattern = @"(?:FROM|JOIN)\s+(?:(?:\w+|""[^""]+"")\.)?(?:\[?(\w+)\]?|""([^""]+)"")\s+(?:AS\s+)?(?:""?([^""\s,()]+)""?|(\w+))(?=\s|$|ON|WHERE|GROUP|ORDER|HAVING)";
+            var tableAliasMatches = Regex.Matches(sql, tableAliasPattern, RegexOptions.IgnoreCase);
+            foreach (Match aliasMatch in tableAliasMatches)
+            {
+                var alias = aliasMatch.Groups[3].Success ? aliasMatch.Groups[3].Value : 
+                           aliasMatch.Groups[4].Success ? aliasMatch.Groups[4].Value : "";
+                alias = alias.Trim('"', ' ');
+                // Skip if it's a SQL keyword or looks like a column reference
+                if (!string.IsNullOrEmpty(alias) && 
+                    !Regex.IsMatch(alias, @"^(ON|WHERE|GROUP|ORDER|HAVING|AND|OR|INNER|LEFT|RIGHT|FULL|CROSS)$", RegexOptions.IgnoreCase))
+                {
+                    referencedAliases.Add(alias);
+                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found table alias: '{alias}'");
+                }
+            }
+
+            // Extract table aliases from column references like "tableAlias"."column" BEFORE table extraction
+            // This ensures we know aliases before extracting tables
+            // Pattern: identifier."column" - matches R."column" or "R"."column"
+            var tableAliasFromColumnPattern = @"(\w+|""[^""]+"")\s*\.\s*""[^""]+""";
+            var tableAliasFromColumnMatches = Regex.Matches(sql, tableAliasFromColumnPattern, RegexOptions.IgnoreCase);
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found {tableAliasFromColumnMatches.Count} potential table aliases from column references (pattern: identifier.\"column\")");
+            foreach (Match aliasMatch in tableAliasFromColumnMatches)
+            {
+                if (aliasMatch.Groups[1].Success)
+                {
+                    var alias = aliasMatch.Groups[1].Value.Trim('"', ' ');
+                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Potential alias from column reference: '{alias}' (match: {aliasMatch.Value})");
+                    // Skip if it's a SQL keyword
+                    if (!string.IsNullOrEmpty(alias) && 
+                        !Regex.IsMatch(alias, @"^(ON|WHERE|GROUP|ORDER|HAVING|AND|OR|INNER|LEFT|RIGHT|FULL|CROSS|FROM|JOIN|SELECT)$", RegexOptions.IgnoreCase))
+                    {
+                        referencedAliases.Add(alias);
+                        DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added table alias from column reference: '{alias}'");
+                    }
+                }
+            }
 
             // Extract schema.table.column references using regex
             var referencedSchemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1206,17 +1343,18 @@ namespace ETL_rod787.Services
                            match.Groups[4].Success ? match.Groups[4].Value : 
                            match.Groups[2].Value.Trim('[', ']', '"');
                 
-                DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found table reference: '{table}' (is CTE: {referencedAliases.Contains(table)})");
+                bool isAliasOrCte = referencedAliases.Contains(table);
+                DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found table reference: '{table}' (is alias/CTE: {isAliasOrCte}, all aliases: [{string.Join(", ", referencedAliases)}])");
                 
-                // Skip CTE names - they're already in referencedAliases
-                if (!referencedAliases.Contains(table))
+                // Skip CTE names and aliases - they're already in referencedAliases
+                if (!isAliasOrCte)
                 {
                     referencedTables.Add(table);
                     DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added '{table}' to referencedTables");
                 }
                 else
                 {
-                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Skipped '{table}' - it's a CTE");
+                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Skipped '{table}' - it's a CTE or alias");
                 }
             }
 
@@ -1303,7 +1441,13 @@ namespace ETL_rod787.Services
             }
 
             var allowedTables = new HashSet<string>(tableNames, StringComparer.OrdinalIgnoreCase);
-            foreach (var a in referencedAliases) allowedTables.Add(a);
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] referencedAliases before adding to allowedTables: {string.Join(", ", referencedAliases)}");
+            foreach (var a in referencedAliases) 
+            {
+                allowedTables.Add(a);
+                DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added alias '{a}' to allowedTables");
+            }
+            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Total allowedTables count: {allowedTables.Count} (includes {referencedAliases.Count} aliases)");
 
             var allowedColumns = new HashSet<string>(tempColumns, StringComparer.OrdinalIgnoreCase);
             foreach (var a in topLevelSelectAliases) allowedColumns.Add(a);
@@ -2029,9 +2173,19 @@ namespace ETL_rod787.Services
                 {
                     string descriptionLower = description.ToLowerInvariant();
                     
+                    // Check for ONE_ROW_EXISTS - table-level rule for mandatory tables
+                    // Pattern: "When a table is marked as mandatory, checks at least one record is added"
+                    if (descriptionLower.Contains("table is marked as mandatory") && 
+                        (descriptionLower.Contains("checks at least one record") || descriptionLower.Contains("at least one record is added")))
+                    {
+                        operatorCode = "ONE_ROW_EXISTS";
+                        ruleLevel = "TABLE";
+                        columnName = null; // Set to NULL for TABLE-level rules
+                        ruleParamIsNull = true;
+                    }
                     // Check for UNIQUE constraint
                     // Pattern: "Checks if ColumnX, ColumnY, and ColumnZ are unique(s) within (the) table"
-                    if (descriptionLower.StartsWith("checks if ") && (descriptionLower.Contains("unique") && descriptionLower.Contains("within")))
+                    else if (descriptionLower.StartsWith("checks if ") && (descriptionLower.Contains("unique") && descriptionLower.Contains("within")))
                     {
                         // Extract column names from description
                         operatorCode = "UNIQUE";
@@ -2246,4 +2400,4 @@ namespace ETL_rod787.Services
         }
 
     }
-}
+} 

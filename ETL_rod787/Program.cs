@@ -20,7 +20,7 @@ var schemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 Console.WriteLine("DDL: ", ddl);
 // Set row boundaries for Excel processing
 int expressionsStartRow = 3;  // Set your starting row number here
-int expressionsEndRow = 261;    // Set your ending row number here
+int expressionsEndRow = 301;    // Set your ending row number here
 var transformer = new QCTransformatorMSSQL("C:/Users/Korisnik/Desktop/nikola/rod14/QC_rules_colored_by_type.xlsx", ddl, expressionsStartRow, expressionsEndRow, schemaMap);
 var transformed = transformer.ProcessExpressionsFromExcel();
 
