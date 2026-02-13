@@ -124,9 +124,11 @@ namespace ETL_rod787.Services
         {
             if (string.IsNullOrWhiteSpace(ddl))
             {
-                Console.WriteLine("Warning: DDL is empty, dictionaries will not be populated");
+                Console.WriteLine("ERROR: DDL is empty, dictionaries will not be populated");
                 return;
             }
+            
+            Console.WriteLine($"[DDL Parse] Starting DDL parsing. DDL length: {ddl.Length} characters");
 
             // Track current schema being parsed
             string currentSchema = null;
@@ -165,7 +167,9 @@ namespace ETL_rod787.Services
                 }
                 
                 // Match CREATE TABLE with optional schema prefix
-                var createMatch = Regex.Match(trimmed, @"CREATE\s+TABLE\s+(?:(\w+)\.)?(?:""([^""]+)""|(\w+))", RegexOptions.IgnoreCase);
+                // Pattern: CREATE TABLE [schema.]"table" or CREATE TABLE [schema.]table
+                // Handles: rod184_wise3_new."AdditionalWaterResources" or "schema"."table" or schema.table
+                var createMatch = Regex.Match(trimmed, @"CREATE\s+TABLE\s+(?:(?:""([^""]+)""|([a-zA-Z_][a-zA-Z0-9_]*))\.)?(?:""([^""]+)""|([a-zA-Z_][a-zA-Z0-9_]*))", RegexOptions.IgnoreCase);
                 if (createMatch.Success)
                 {
                     // Save previous table
@@ -174,14 +178,25 @@ namespace ETL_rod787.Services
                         SaveTableToSchema(currentSchema, currentTable, currentColumns);
                     }
                     
-                    // Use schema from CREATE TABLE if specified, otherwise use current schema
-                    string tableSchema = createMatch.Groups[1].Success ? createMatch.Groups[1].Value : currentSchema;
+                    // Extract schema: group 1 (quoted) or group 2 (unquoted)
+                    string tableSchema = createMatch.Groups[1].Success ? createMatch.Groups[1].Value 
+                                       : (createMatch.Groups[2].Success ? createMatch.Groups[2].Value : currentSchema);
                     if (tableSchema != null)
                     {
                         currentSchema = tableSchema;
+                        Console.WriteLine($"[DDL Parse] Found schema: {currentSchema}");
                     }
                     
-                    currentTable = createMatch.Groups[2].Success ? createMatch.Groups[2].Value : createMatch.Groups[3].Value;
+                    // Extract table: group 3 (quoted) or group 4 (unquoted)
+                    currentTable = createMatch.Groups[3].Success ? createMatch.Groups[3].Value 
+                                 : (createMatch.Groups[4].Success ? createMatch.Groups[4].Value : null);
+                    if (currentTable == null)
+                    {
+                        Console.WriteLine($"[DDL Parse] WARNING: Could not extract table name from: {trimmed}");
+                        continue; // Skip if table name not found
+                    }
+                    
+                    Console.WriteLine($"[DDL Parse] Found table: {currentSchema}.{currentTable}");
                     currentColumns = new List<string>();
                     inTableDef = true;
                     parenDepth = CountChar(trimmed, '(') - CountChar(trimmed, ')');
@@ -278,19 +293,35 @@ namespace ETL_rod787.Services
             
             // Print summary per schema
             Console.WriteLine($"\n=== DDL Parsing Summary ===");
-            foreach (var schemaKvp in schemaTableColumns)
+            if (schemaTableColumns.Count == 0)
             {
-                Console.WriteLine($"\nSchema: {schemaKvp.Key}");
-                Console.WriteLine($"  Tables: {schemaKvp.Value.Count}");
-                foreach (var tableKvp in schemaKvp.Value)
+                Console.WriteLine("WARNING: No schemas/tables found in DDL! Check DDL format.");
+            }
+            else
+            {
+                foreach (var schemaKvp in schemaTableColumns)
                 {
-                    Console.WriteLine($"    {tableKvp.Key}: {tableKvp.Value.Length} columns");
+                    Console.WriteLine($"\nSchema: {schemaKvp.Key}");
+                    Console.WriteLine($"  Tables: {schemaKvp.Value.Count}");
+                    foreach (var tableKvp in schemaKvp.Value)
+                    {
+                        Console.WriteLine($"    {tableKvp.Key}: {tableKvp.Value.Length} columns");
+                    }
                 }
             }
             
             // Print merged summary for backward compatibility
             Console.WriteLine($"\nTotal tables parsed (merged): {table_columns.Count}");
             Console.WriteLine($"Total columns (merged): {ColumnNameMap.Count}");
+            
+            if (table_columns.Count == 0)
+            {
+                Console.WriteLine("\nERROR: No tables were parsed from DDL! This will cause all rows to be skipped.");
+                Console.WriteLine("Please check:");
+                Console.WriteLine("  1. DDL file path is correct");
+                Console.WriteLine("  2. DDL contains CREATE TABLE statements");
+                Console.WriteLine("  3. Table names match format: CREATE TABLE [schema.]\"table\" or CREATE TABLE [schema.]table");
+            }
 
             // Parse ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY statements (schema-aware)
             // Pattern: ALTER TABLE [schema.]"table" ADD CONSTRAINT name FOREIGN KEY ("column") REFERENCES [schema.]"table"("column")
@@ -906,8 +937,8 @@ namespace ETL_rod787.Services
             // Column references like R."column" add R to Tables, but if R is an alias, it shouldn't be in referencedTables
             referencedTables.RemoveWhere(t => referencedAliases.Contains(t));
             
-            DebugWriteLine($"[DEBUG AnalyzeSql] referencedAliases: {string.Join(", ", referencedAliases)}");
-            DebugWriteLine($"[DEBUG AnalyzeSql] referencedTables after removing aliases: {string.Join(", ", referencedTables)}");
+            //DebugWriteLine($"[DEBUG AnalyzeSql] referencedAliases: {string.Join(", ", referencedAliases)}");
+            //DebugWriteLine($"[DEBUG AnalyzeSql] referencedTables after removing aliases: {string.Join(", ", referencedTables)}");
 
             var allowedTables = new HashSet<string>(tableNames, StringComparer.OrdinalIgnoreCase);
             foreach (var a in referencedAliases) 
@@ -920,10 +951,10 @@ namespace ETL_rod787.Services
             foreach (var a in topLevelSelectAliases) allowedColumns.Add(a);
             allowedColumns.Add("record_id");
 
-            DebugWriteLine($"[DEBUG AnalyzeSql] Checking unknown tables. referencedTables: {string.Join(", ", referencedTables)}");
-            DebugWriteLine($"[DEBUG AnalyzeSql] allowedTables (first 10): {string.Join(", ", allowedTables.Take(10))}...");
+            //DebugWriteLine($"[DEBUG AnalyzeSql] Checking unknown tables. referencedTables: {string.Join(", ", referencedTables)}");
+            //DebugWriteLine($"[DEBUG AnalyzeSql] allowedTables (first 10): {string.Join(", ", allowedTables.Take(10))}...");
             var unknownTables = referencedTables.Where(t => !allowedTables.Contains(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            DebugWriteLine($"[DEBUG AnalyzeSql] unknownTables result: {string.Join(", ", unknownTables)}");
+            //DebugWriteLine($"[DEBUG AnalyzeSql] unknownTables result: {string.Join(", ", unknownTables)}");
             var unknownColumns = referencedColumns.Where(c => !allowedColumns.Contains(c)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             // Check against SchemaMap keys (source schemas) and values (target schemas)
             var nonDatasetSchemas = referencedSchemas.Where(s => 
@@ -1110,15 +1141,15 @@ namespace ETL_rod787.Services
                         
                         cteColsMap[cteName] = cols;
                         cteList.Add(new CteBlock { Name = cteName, Query = cteQuery });
-                        DebugWriteLine($"[DEBUG AnalyzePostgresSql] Extracted CTE: '{cteName}' with columns: {string.Join(", ", cols)}");
+                        //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Extracted CTE: '{cteName}' with columns: {string.Join(", ", cols)}");
                     }
                 }
             }
             
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Total CTEs extracted: {cteColsMap.Count}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Total CTEs extracted: {cteColsMap.Count}");
             foreach (var kvp in cteColsMap)
             {
-                DebugWriteLine($"[DEBUG AnalyzePostgresSql] CTE '{kvp.Key}' -> columns: {string.Join(", ", kvp.Value)}");
+                //DebugWriteLine($"[DEBUG AnalyzePostgresSql] CTE '{kvp.Key}' -> columns: {string.Join(", ", kvp.Value)}");
             }
 
             var cteColumnsAll = cteColsMap.SelectMany(kv => kv.Value).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -1157,7 +1188,7 @@ namespace ETL_rod787.Services
             // Need to handle nested parentheses properly
             var joinSubqueryPattern = @"(?:INNER\s+)?(?:LEFT|RIGHT|FULL\s+)?JOIN\s+\(";
             var joinSubqueryMatches = Regex.Matches(sql, joinSubqueryPattern, RegexOptions.IgnoreCase);
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found {joinSubqueryMatches.Count} JOIN subquery patterns");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found {joinSubqueryMatches.Count} JOIN subquery patterns");
             foreach (Match joinMatch in joinSubqueryMatches)
             {
                 int startPos = joinMatch.Index + joinMatch.Length;
@@ -1213,12 +1244,12 @@ namespace ETL_rod787.Services
                             !Regex.IsMatch(alias, @"^(ON|WHERE|GROUP|ORDER|HAVING|AND|OR|INNER|LEFT|RIGHT|FULL|CROSS)$", RegexOptions.IgnoreCase))
                         {
                             referencedAliases.Add(alias);
-                            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found subquery alias in JOIN: '{alias}' at position {endPos + aliasMatch.Index}");
+                            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found subquery alias in JOIN: '{alias}' at position {endPos + aliasMatch.Index}");
                         }
                     }
                     else
                     {
-                        DebugWriteLine($"[DEBUG AnalyzePostgresSql] No alias found after JOIN subquery at position {endPos}, text: '{afterParen.Substring(0, Math.Min(30, afterParen.Length))}'");
+                        //DebugWriteLine($"[DEBUG AnalyzePostgresSql] No alias found after JOIN subquery at position {endPos}, text: '{afterParen.Substring(0, Math.Min(30, afterParen.Length))}'");
                     }
                 }
             }
@@ -1237,7 +1268,7 @@ namespace ETL_rod787.Services
                     !Regex.IsMatch(alias, @"^(ON|WHERE|GROUP|ORDER|HAVING|AND|OR|INNER|LEFT|RIGHT|FULL|CROSS)$", RegexOptions.IgnoreCase))
                 {
                     referencedAliases.Add(alias);
-                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found table alias: '{alias}'");
+                    //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found table alias: '{alias}'");
                 }
             }
 
@@ -1246,19 +1277,19 @@ namespace ETL_rod787.Services
             // Pattern: identifier."column" - matches R."column" or "R"."column"
             var tableAliasFromColumnPattern = @"(\w+|""[^""]+"")\s*\.\s*""[^""]+""";
             var tableAliasFromColumnMatches = Regex.Matches(sql, tableAliasFromColumnPattern, RegexOptions.IgnoreCase);
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found {tableAliasFromColumnMatches.Count} potential table aliases from column references (pattern: identifier.\"column\")");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found {tableAliasFromColumnMatches.Count} potential table aliases from column references (pattern: identifier.\"column\")");
             foreach (Match aliasMatch in tableAliasFromColumnMatches)
             {
                 if (aliasMatch.Groups[1].Success)
                 {
                     var alias = aliasMatch.Groups[1].Value.Trim('"', ' ');
-                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Potential alias from column reference: '{alias}' (match: {aliasMatch.Value})");
+                    //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Potential alias from column reference: '{alias}' (match: {aliasMatch.Value})");
                     // Skip if it's a SQL keyword
                     if (!string.IsNullOrEmpty(alias) && 
                         !Regex.IsMatch(alias, @"^(ON|WHERE|GROUP|ORDER|HAVING|AND|OR|INNER|LEFT|RIGHT|FULL|CROSS|FROM|JOIN|SELECT)$", RegexOptions.IgnoreCase))
                     {
                         referencedAliases.Add(alias);
-                        DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added table alias from column reference: '{alias}'");
+                        //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added table alias from column reference: '{alias}'");
                     }
                 }
             }
@@ -1322,14 +1353,14 @@ namespace ETL_rod787.Services
             // IMPORTANT: Only match FROM/JOIN that are NOT inside function calls
             var tableRefPattern = @"(?:FROM|JOIN)\s+(?:(?:(\w+|""[^""]+"")\.)?(\[?(\w+)\]?|""([^""]+)""))";
             var tableMatches = Regex.Matches(sql, tableRefPattern, RegexOptions.IgnoreCase);
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found {tableMatches.Count} potential table references in FROM/JOIN");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found {tableMatches.Count} potential table references in FROM/JOIN");
             foreach (Match match in tableMatches)
             {
                 // Skip if this FROM/JOIN is inside a function call
                 bool isInFunction = functionArgRangesForTables.Any(range => match.Index >= range.Item1 && match.Index <= range.Item2);
                 if (isInFunction)
                 {
-                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Skipped table match at position {match.Index} - inside function call");
+                    //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Skipped table match at position {match.Index} - inside function call");
                     continue;
                 }
 
@@ -1337,24 +1368,24 @@ namespace ETL_rod787.Services
                 {
                     var schema = match.Groups[1].Value.Trim('"');
                     referencedSchemas.Add(schema);
-                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found schema: '{schema}'");
+                    //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found schema: '{schema}'");
                 }
                 var table = match.Groups[3].Success ? match.Groups[3].Value : 
                            match.Groups[4].Success ? match.Groups[4].Value : 
                            match.Groups[2].Value.Trim('[', ']', '"');
                 
                 bool isAliasOrCte = referencedAliases.Contains(table);
-                DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found table reference: '{table}' (is alias/CTE: {isAliasOrCte}, all aliases: [{string.Join(", ", referencedAliases)}])");
+                //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Found table reference: '{table}' (is alias/CTE: {isAliasOrCte}, all aliases: [{string.Join(", ", referencedAliases)}])");
                 
                 // Skip CTE names and aliases - they're already in referencedAliases
                 if (!isAliasOrCte)
                 {
                     referencedTables.Add(table);
-                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added '{table}' to referencedTables");
+                    //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added '{table}' to referencedTables");
                 }
                 else
                 {
-                    DebugWriteLine($"[DEBUG AnalyzePostgresSql] Skipped '{table}' - it's a CTE or alias");
+                    //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Skipped '{table}' - it's a CTE or alias");
                 }
             }
 
@@ -1441,13 +1472,13 @@ namespace ETL_rod787.Services
             }
 
             var allowedTables = new HashSet<string>(tableNames, StringComparer.OrdinalIgnoreCase);
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] referencedAliases before adding to allowedTables: {string.Join(", ", referencedAliases)}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] referencedAliases before adding to allowedTables: {string.Join(", ", referencedAliases)}");
             foreach (var a in referencedAliases) 
             {
                 allowedTables.Add(a);
-                DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added alias '{a}' to allowedTables");
+                //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Added alias '{a}' to allowedTables");
             }
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Total allowedTables count: {allowedTables.Count} (includes {referencedAliases.Count} aliases)");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Total allowedTables count: {allowedTables.Count} (includes {referencedAliases.Count} aliases)");
 
             var allowedColumns = new HashSet<string>(tempColumns, StringComparer.OrdinalIgnoreCase);
             foreach (var a in topLevelSelectAliases) allowedColumns.Add(a);
@@ -1464,35 +1495,35 @@ namespace ETL_rod787.Services
 
             // Exclude CTE names from unknown tables check
             // Also check if table name matches any CTE name (case-insensitive)
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking unknown tables. referencedTables: {string.Join(", ", referencedTables)}");
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] allowedTables (first 10): {string.Join(", ", allowedTables.Take(10))}...");
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] referencedAliases (CTEs): {string.Join(", ", referencedAliases)}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking unknown tables. referencedTables: {string.Join(", ", referencedTables)}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] allowedTables (first 10): {string.Join(", ", allowedTables.Take(10))}...");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] referencedAliases (CTEs): {string.Join(", ", referencedAliases)}");
             var unknownTables = referencedTables.Where(t => 
                 !allowedTables.Contains(t) && 
                 !referencedAliases.Contains(t) &&
                 !cteColsMap.Keys.Any(cte => cte.Equals(t, StringComparison.OrdinalIgnoreCase)))
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] unknownTables result: {string.Join(", ", unknownTables)}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] unknownTables result: {string.Join(", ", unknownTables)}");
             
             // Exclude CTE names from unknown columns check
             // Also check if column name matches any CTE name (case-insensitive) - CTEs can be used as table aliases
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking unknown columns. referencedColumns (first 10): {string.Join(", ", referencedColumns.Take(10))}...");
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] allowedColumns (first 10): {string.Join(", ", allowedColumns.Take(10))}...");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking unknown columns. referencedColumns (first 10): {string.Join(", ", referencedColumns.Take(10))}...");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] allowedColumns (first 10): {string.Join(", ", allowedColumns.Take(10))}...");
             var unknownColumns = referencedColumns.Where(c => 
                 !allowedColumns.Contains(c) && 
                 !referencedAliases.Contains(c) &&
                 !cteColsMap.Keys.Any(cte => cte.Equals(c, StringComparison.OrdinalIgnoreCase)))
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] unknownColumns result: {string.Join(", ", unknownColumns)}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] unknownColumns result: {string.Join(", ", unknownColumns)}");
             
             // Check against SchemaMap keys (source schemas) and values (target schemas)
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking schemas. referencedSchemas: {string.Join(", ", referencedSchemas)}");
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] SchemaMap keys: {string.Join(", ", SchemaMap.Keys)}");
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] SchemaMap values: {string.Join(", ", SchemaMap.Values)}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking schemas. referencedSchemas: {string.Join(", ", referencedSchemas)}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] SchemaMap keys: {string.Join(", ", SchemaMap.Keys)}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] SchemaMap values: {string.Join(", ", SchemaMap.Values)}");
             var nonDatasetSchemas = referencedSchemas.Where(s => 
                 !SchemaMap.ContainsKey(s) && !SchemaMap.Values.Contains(s, StringComparer.OrdinalIgnoreCase))
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            DebugWriteLine($"[DEBUG AnalyzePostgresSql] nonDatasetSchemas result: {string.Join(", ", nonDatasetSchemas)}");
+            //DebugWriteLine($"[DEBUG AnalyzePostgresSql] nonDatasetSchemas result: {string.Join(", ", nonDatasetSchemas)}");
 
             result.Ctes = cteList;
             result.UnknownTables = unknownTables;
@@ -1921,20 +1952,28 @@ namespace ETL_rod787.Services
                 }
 
                 // DEBUG: Print analysis results
-                DebugWriteLine($"\n=== DEBUG Row {r} ===");
-                DebugWriteLine($"CTEs found: {string.Join(", ", analysis.Ctes?.Select(c => c.Name) ?? new string[0])}");
-                DebugWriteLine($"UnknownTables: {string.Join(", ", analysis.UnknownTables ?? new string[0])}");
-                DebugWriteLine($"UnknownColumns: {string.Join(", ", analysis.UnknownColumns ?? new string[0])}");
-                DebugWriteLine($"NonDatasetSchemas: {string.Join(", ", analysis.NonDatasetSchemas ?? new string[0])}");
-                DebugWriteLine($"TableNames (allowed): {string.Join(", ", analysis.TableNames?.Take(10) ?? new string[0])}...");
-                DebugWriteLine($"AllTempColumns (allowed): {string.Join(", ", analysis.AllTempColumns?.Take(10) ?? new string[0])}...");
-                DebugWriteLine($"===================\n");
+                //DebugWriteLine($"\n=== DEBUG Row {r} ===");
+                //DebugWriteLine($"CTEs found: {string.Join(", ", analysis.Ctes?.Select(c => c.Name) ?? new string[0])}");
+               // DebugWriteLine($"UnknownTables: {string.Join(", ", analysis.UnknownTables ?? new string[0])}");
+                //DebugWriteLine($"UnknownColumns: {string.Join(", ", analysis.UnknownColumns ?? new string[0])}");
+                //DebugWriteLine($"NonDatasetSchemas: {string.Join(", ", analysis.NonDatasetSchemas ?? new string[0])}");
+                //DebugWriteLine($"TableNames (allowed): {string.Join(", ", analysis.TableNames?.Take(10) ?? new string[0])}...");
+                //DebugWriteLine($"AllTempColumns (allowed): {string.Join(", ", analysis.AllTempColumns?.Take(10) ?? new string[0])}...");
+                //DebugWriteLine($"===================\n");
 
-                if (analysis.UnknownTables.Length == 0 && analysis.UnknownColumns.Length == 0 && analysis.NonDatasetSchemas.Length == 0)
+                // Transform SQL even if there are unknown tables/columns/schemas
+                // (e.g., vocabulary tables, other schemas) - as long as SQL syntax is valid
+                // Only skip if there are actual parse errors (handled above)
+                try
                 {
-                    // safe to transform
                     var transformed = TransformToPostgres(expr);
                     outputs.Add((r, expr, transformed));
+                    
+                    // Log warnings about unknown tables/columns but still transform
+                    if (analysis.UnknownTables.Length > 0 || analysis.UnknownColumns.Length > 0 || analysis.NonDatasetSchemas.Length > 0)
+                    {
+                        DebugWriteLine($"Row {r}: WARNING: Transformed SQL with unknown tables/columns/schemas - UnknownTables: {string.Join(", ", analysis.UnknownTables)}, UnknownColumns: {string.Join(", ", analysis.UnknownColumns)}, NonDatasetSchemas: {string.Join(", ", analysis.NonDatasetSchemas)}");
+                    }
 
                     // Print formatted result
                     Console.WriteLine($"row {r}:");
@@ -1944,14 +1983,9 @@ namespace ETL_rod787.Services
                     Console.WriteLine("====================================================");
                     Console.WriteLine();
                 }
-                else
+                catch (Exception ex)
                 {
-                    var parts = new List<string>();
-                    if (analysis.UnknownTables.Length > 0) parts.Add($"unknown tables: {string.Join(',', analysis.UnknownTables)}");
-                    if (analysis.UnknownColumns.Length > 0) parts.Add($"unknown columns: {string.Join(',', analysis.UnknownColumns)}");
-                    if (analysis.NonDatasetSchemas.Length > 0) parts.Add($"non-dataset schemas: {string.Join(',', analysis.NonDatasetSchemas)}");
-                    var msg = parts.Count == 0 ? "unknown references" : string.Join("; ", parts);
-                    DebugWriteLine($"Row {r}: ERROR: {msg}");
+                    DebugWriteLine($"Row {r}: ERROR: Failed to transform SQL: {ex.Message}");
                 }
             }
 
@@ -1986,6 +2020,45 @@ namespace ETL_rod787.Services
             
             // Fallback: return as-is (shouldn't happen if schema is correct)
             return columnName;
+        }
+
+        /// <summary>
+        /// Adds a 'message' column to the final SELECT: first column _id, then 0..n other columns, last column message.
+        /// Operates on the outer query only. Uses parenthesis depth so we never insert inside EXTRACT(... FROM ...) or other functions.
+        /// </summary>
+        private string AddMessageColumnToSql(string sql, string message)
+        {
+            if (string.IsNullOrEmpty(sql)) return sql;
+
+            // Escape single quotes in message for SQL
+            string escapedMessage = message?.Replace("'", "''") ?? "";
+
+            // Don't add twice if already present
+            if (Regex.IsMatch(sql, @"AS\s+""message""", RegexOptions.IgnoreCase))
+                return sql;
+
+            // Find the " FROM " that is at parenthesis depth 0 (main query's FROM), not inside EXTRACT(... FROM ...) or CTEs.
+            int depth = 0;
+            int lastFromAtDepthZero = -1;
+            for (int i = 0; i < sql.Length; i++)
+            {
+                char c = sql[i];
+                if (c == '(') depth++;
+                else if (c == ')') depth--;
+                else if (depth == 0 && i > 0 && i + 5 <= sql.Length
+                    && char.IsWhiteSpace(sql[i - 1])
+                    && sql.Substring(i, 5).Equals("FROM ", StringComparison.OrdinalIgnoreCase))
+                {
+                    lastFromAtDepthZero = i;
+                }
+            }
+
+            if (lastFromAtDepthZero < 0) return sql;
+
+            string toInsert = $", '{escapedMessage}' AS \"message\" ";
+            sql = sql.Substring(0, lastFromAtDepthZero) + toInsert + sql.Substring(lastFromAtDepthZero);
+
+            return sql;
         }
 
 
@@ -2118,13 +2191,47 @@ namespace ETL_rod787.Services
                 // ALL SQL expressions MUST have operator_code = 'SQL'
                 if (transformedByRow.ContainsKey(r))
                 {
-                    // SQL query case - wrap in {"sql": "..."}
+                    // SQL query case - add message column and wrap in {"sql": "..."}
                     operatorCode = "SQL";
+                    string sqlWithMessage = AddMessageColumnToSql(transformedByRow[r], additionalContext);
                     var jsonObject = new JsonObject
                     {
-                        ["sql"] = transformedByRow[r]
+                        ["sql"] = sqlWithMessage
                     };
                     jsonString = jsonObject.ToJsonString();
+                }
+                // If no transformed SQL but expression exists and looks like SQL, try to transform it now
+                // This handles cases where ProcessExpressionsFromExcel rejected it but we still want to transform
+                else if (!string.IsNullOrWhiteSpace(expression))
+                {
+                    // More strict check: must start with SELECT, WITH, or contain SELECT ... FROM pattern
+                    bool looksLikeSql = Regex.IsMatch(expression.Trim(), @"^\s*(SELECT|WITH|INSERT|UPDATE|DELETE)\b", RegexOptions.IgnoreCase) ||
+                                       Regex.IsMatch(expression, @"\bSELECT\s+.*?\s+FROM\b", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+                    
+                    if (looksLikeSql)
+                    {
+                        try
+                        {
+                            // Try to transform the SQL expression (skip validation - just transform)
+                            string transformedSql = TransformToPostgres(expression);
+                            if (!string.IsNullOrWhiteSpace(transformedSql) && transformedSql != expression)
+                            {
+                                operatorCode = "SQL";
+                                string sqlWithMessage = AddMessageColumnToSql(transformedSql, additionalContext);
+                                var jsonObject = new JsonObject
+                                {
+                                    ["sql"] = sqlWithMessage
+                                };
+                                jsonString = jsonObject.ToJsonString();
+                            }
+                            // If transformation didn't change anything, fall through to description-based logic
+                        }
+                        catch (Exception ex)
+                        {
+                            // If transformation fails, fall through to description-based logic
+                            Console.WriteLine($"Warning: Could not transform SQL for row {r}: {ex.Message}");
+                        }
+                    }
                 }
                 // Check for MATCH patterns in Column F (expression) - PATTERN operator_code
                 else if (!string.IsNullOrWhiteSpace(expression) && expression.Contains("MATCH", StringComparison.OrdinalIgnoreCase))
@@ -2389,7 +2496,8 @@ namespace ETL_rod787.Services
 
                 // Get target schema from SchemaMap (use first target schema if available)
                 string targetSchema = SchemaMap.Values.FirstOrDefault() ?? "rod14_wise6"; // fallback for backward compatibility
-                string insertSql = $"INSERT INTO {targetSchema}.qc_rules_internal (code, table_name, column_name, rule_level, operator_code, rule_param, severity, enabled) VALUES ('{code.Replace("'", "''")}', '{tableName.Replace("'", "''")}', {(string.IsNullOrWhiteSpace(columnName) ? "NULL" : $"'{columnName.Replace("'", "''")}'")}, '{ruleLevel}', '{operatorCode}', {ruleParamValue}, {(string.IsNullOrWhiteSpace(severity) ? "NULL" : $"'{severity.Replace("'", "''")}'")}, true);";
+                string messageValue = string.IsNullOrWhiteSpace(additionalContext) ? "NULL" : $"'{additionalContext.Replace("'", "''")}'";
+                string insertSql = $"INSERT INTO {targetSchema}.qc_rules_internal (code, table_name, column_name, rule_level, operator_code, rule_param, severity, enabled, message) VALUES ('{code.Replace("'", "''")}', '{tableName.Replace("'", "''")}', {(string.IsNullOrWhiteSpace(columnName) ? "NULL" : $"'{columnName.Replace("'", "''")}'")}, '{ruleLevel}', '{operatorCode}', {ruleParamValue}, {(string.IsNullOrWhiteSpace(severity) ? "NULL" : $"'{severity.Replace("'", "''")}'")}, true, {messageValue});";
 
                 insertStatements.Add(insertSql);
             }
