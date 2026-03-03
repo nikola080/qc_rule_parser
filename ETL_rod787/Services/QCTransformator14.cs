@@ -58,6 +58,15 @@ namespace ETL_rod787.Services
 
         private int expressionsStartRow;
         private int expressionsEndRow;
+        
+        // Configurable Excel column indices (0-based: A=0, B=1, C=2, D=3, E=4, F=5, G=6, H=7, I=8, etc.)
+        protected int columnIndexTableName = 0;      // Column A
+        protected int columnIndexColumnName = 1;    // Column B
+        protected int columnIndexCode = 2;          // Column C
+        protected int columnIndexDescription = 4;   // Column E
+        protected int columnIndexExpression = 6;     // Column G (was F=5, now G=6)
+        protected int columnIndexSeverity = 7;      // Column H
+        protected int columnIndexAdditionalContext = 8; // Column I
 
         /// <summary>
         /// Column name mapping to CamelCase format used in DDL (lowercase -> CamelCase)
@@ -78,13 +87,42 @@ namespace ETL_rod787.Services
         /// Example: { "dataset_93286": "rod14_wise6" }
         /// </summary>
         protected Dictionary<string, string> SchemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        
+        /// <summary>
+        /// Schema+Table mapping (source schema, source table) -> target schema
+        /// This overrides SchemaMap for specific tables
+        /// Example: { ("dataset_93519", "dataflowmetadata"): "rod14_wise6_new" }
+        /// </summary>
+        protected Dictionary<(string Schema, string Table), string> SchemaTableMap = 
+            new Dictionary<(string Schema, string Table), string>(new SchemaTableComparer());
+        
+        /// <summary>
+        /// Comparer for schema+table tuples (case-insensitive)
+        /// </summary>
+        private class SchemaTableComparer : IEqualityComparer<(string Schema, string Table)>
+        {
+            public bool Equals((string Schema, string Table) x, (string Schema, string Table) y)
+            {
+                return string.Equals(x.Schema, y.Schema, StringComparison.OrdinalIgnoreCase) &&
+                       string.Equals(x.Table, y.Table, StringComparison.OrdinalIgnoreCase);
+            }
+            
+            public int GetHashCode((string Schema, string Table) obj)
+            {
+                return StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Schema) ^
+                       StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Table);
+            }
+        }
 
         /// <summary>
         /// Column types dictionary (merged from all schemas for backward compatibility)
         /// </summary>
         protected Dictionary<string, string> _columnTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        public QCTransformator14(string path, string ddl, int expressionsStartRow, int expressionsEndRow, Dictionary<string, string>? schemaMap = null)
+        public QCTransformator14(string path, string ddl, int expressionsStartRow, int expressionsEndRow, Dictionary<string, string>? schemaMap = null,
+            Dictionary<(string Schema, string Table), string>? schemaTableMap = null,
+            int? columnIndexTableName = null, int? columnIndexColumnName = null, int? columnIndexCode = null,
+            int? columnIndexDescription = null, int? columnIndexExpression = null, int? columnIndexSeverity = null, int? columnIndexAdditionalContext = null)
         {
             try
             {
@@ -106,10 +144,25 @@ namespace ETL_rod787.Services
             this.expressionsStartRow = expressionsStartRow;
             this.expressionsEndRow = expressionsEndRow;
 
+            // Set configurable column indices (use provided values or defaults)
+            if (columnIndexTableName.HasValue) this.columnIndexTableName = columnIndexTableName.Value;
+            if (columnIndexColumnName.HasValue) this.columnIndexColumnName = columnIndexColumnName.Value;
+            if (columnIndexCode.HasValue) this.columnIndexCode = columnIndexCode.Value;
+            if (columnIndexDescription.HasValue) this.columnIndexDescription = columnIndexDescription.Value;
+            if (columnIndexExpression.HasValue) this.columnIndexExpression = columnIndexExpression.Value;
+            if (columnIndexSeverity.HasValue) this.columnIndexSeverity = columnIndexSeverity.Value;
+            if (columnIndexAdditionalContext.HasValue) this.columnIndexAdditionalContext = columnIndexAdditionalContext.Value;
+
             // Set schema mapping
             if (schemaMap != null)
             {
                 SchemaMap = new Dictionary<string, string>(schemaMap, StringComparer.OrdinalIgnoreCase);
+            }
+            
+            // Set schema+table mapping (overrides schema mapping for specific tables)
+            if (schemaTableMap != null)
+            {
+                SchemaTableMap = new Dictionary<(string Schema, string Table), string>(schemaTableMap, new SchemaTableComparer());
             }
 
             // Parse DDL to build dictionaries
@@ -956,10 +1009,22 @@ namespace ETL_rod787.Services
             var unknownTables = referencedTables.Where(t => !allowedTables.Contains(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             //DebugWriteLine($"[DEBUG AnalyzeSql] unknownTables result: {string.Join(", ", unknownTables)}");
             var unknownColumns = referencedColumns.Where(c => !allowedColumns.Contains(c)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            // Check against SchemaMap keys (source schemas) and values (target schemas)
+            // Check against SchemaMap keys (source schemas), values (target schemas), and SchemaTableMap
+            // A schema is valid if:
+            // 1. It's in SchemaMap (as key or value), OR
+            // 2. Any table from this schema is in SchemaTableMap
             var nonDatasetSchemas = referencedSchemas.Where(s => 
-                !SchemaMap.ContainsKey(s) && !SchemaMap.Values.Contains(s, StringComparer.OrdinalIgnoreCase))
-                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            {
+                // Check SchemaMap
+                if (SchemaMap.ContainsKey(s) || SchemaMap.Values.Contains(s, StringComparer.OrdinalIgnoreCase))
+                    return false;
+                
+                // Check if any table from this schema is in SchemaTableMap
+                bool hasSchemaTableMapping = SchemaTableMap.Keys.Any(k => 
+                    string.Equals(k.Schema, s, StringComparison.OrdinalIgnoreCase));
+                
+                return !hasSchemaTableMapping;
+            }).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
             result.Ctes = cteList;
             result.UnknownTables = unknownTables;
@@ -1516,13 +1581,25 @@ namespace ETL_rod787.Services
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             //DebugWriteLine($"[DEBUG AnalyzePostgresSql] unknownColumns result: {string.Join(", ", unknownColumns)}");
             
-            // Check against SchemaMap keys (source schemas) and values (target schemas)
+            // Check against SchemaMap keys (source schemas), values (target schemas), and SchemaTableMap
+            // A schema is valid if:
+            // 1. It's in SchemaMap (as key or value), OR
+            // 2. Any table from this schema is in SchemaTableMap
             //DebugWriteLine($"[DEBUG AnalyzePostgresSql] Checking schemas. referencedSchemas: {string.Join(", ", referencedSchemas)}");
             //DebugWriteLine($"[DEBUG AnalyzePostgresSql] SchemaMap keys: {string.Join(", ", SchemaMap.Keys)}");
             //DebugWriteLine($"[DEBUG AnalyzePostgresSql] SchemaMap values: {string.Join(", ", SchemaMap.Values)}");
             var nonDatasetSchemas = referencedSchemas.Where(s => 
-                !SchemaMap.ContainsKey(s) && !SchemaMap.Values.Contains(s, StringComparer.OrdinalIgnoreCase))
-                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            {
+                // Check SchemaMap
+                if (SchemaMap.ContainsKey(s) || SchemaMap.Values.Contains(s, StringComparer.OrdinalIgnoreCase))
+                    return false;
+                
+                // Check if any table from this schema is in SchemaTableMap
+                bool hasSchemaTableMapping = SchemaTableMap.Keys.Any(k => 
+                    string.Equals(k.Schema, s, StringComparison.OrdinalIgnoreCase));
+                
+                return !hasSchemaTableMapping;
+            }).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             //DebugWriteLine($"[DEBUG AnalyzePostgresSql] nonDatasetSchemas result: {string.Join(", ", nonDatasetSchemas)}");
 
             result.Ctes = cteList;
@@ -1878,7 +1955,7 @@ namespace ETL_rod787.Services
             return sql;
         }
 
-        public List<(int Row, string Original, string Transformed)> ProcessExpressionsFromExcel(int expressionColumnIndex = 5)
+        public List<(int Row, string Original, string Transformed)> ProcessExpressionsFromExcel()
         {
             var outputs = new List<(int Row, string Original, string Transformed)>();
             if (workbook == null) return outputs;
@@ -1896,11 +1973,46 @@ namespace ETL_rod787.Services
             {
                 var row = sheet.GetRow(r);
                 if (row == null) continue;
-                var cell = row.GetCell(expressionColumnIndex);
+                var cell = row.GetCell(columnIndexExpression);
                 if (cell == null) continue;
 
-                var expr = cell.ToString();
-                if (string.IsNullOrWhiteSpace(expr)) continue;
+                // Handle Excel formulas - get the calculated value, not the formula text
+                string expr;
+                if (cell.CellType == NPOI.SS.UserModel.CellType.Formula)
+                {
+                    // For formulas, get the calculated value
+                    var formulaEvaluator = workbook.GetCreationHelper().CreateFormulaEvaluator();
+                    var evaluatedCell = formulaEvaluator.Evaluate(cell);
+                    expr = evaluatedCell?.StringValue ?? cell.ToString();
+                    DebugWriteLine($"Row {r}: Cell is formula, evaluated value: {(expr != null ? expr.Substring(0, Math.Min(100, expr.Length)) : "null")}");
+                }
+                else
+                {
+                    expr = cell.ToString();
+                }
+                
+                if (string.IsNullOrWhiteSpace(expr))
+                {
+                    DebugWriteLine($"Row {r}: Expression is empty, skipping");
+                    continue;
+                }
+                
+                DebugWriteLine($"Row {r}: Read expression (first 200 chars): {expr.Substring(0, Math.Min(200, expr.Length))}");
+
+                // CRITICAL: Skip if expression doesn't look like SQL (doesn't start with SELECT, WITH, INSERT, UPDATE, DELETE)
+                // This prevents trying to parse text descriptions as SQL
+                string exprTrimmed = expr.Trim();
+                bool looksLikeSql = exprTrimmed.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase) ||
+                                   exprTrimmed.StartsWith("WITH", StringComparison.OrdinalIgnoreCase) ||
+                                   exprTrimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase) ||
+                                   exprTrimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase) ||
+                                   exprTrimmed.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase);
+                
+                if (!looksLikeSql)
+                {
+                    DebugWriteLine($"Row {r}: Expression doesn't look like SQL (doesn't start with SELECT/WITH/INSERT/UPDATE/DELETE), skipping SQL transformation");
+                    continue;
+                }
 
                 // skip parameterized/template queries (e.g. containing tokens like {%...%}, @param, :param, $1)
                 // But exclude string literals from the check to avoid false positives
@@ -1961,19 +2073,13 @@ namespace ETL_rod787.Services
                 //DebugWriteLine($"AllTempColumns (allowed): {string.Join(", ", analysis.AllTempColumns?.Take(10) ?? new string[0])}...");
                 //DebugWriteLine($"===================\n");
 
-                // Transform SQL even if there are unknown tables/columns/schemas
-                // (e.g., vocabulary tables, other schemas) - as long as SQL syntax is valid
-                // Only skip if there are actual parse errors (handled above)
-                try
+                // STRICT VALIDATION: Only transform SQL if ALL tables/columns/schemas match DDL
+                // Excel has lowercase table/column names that must match DDL (via schemaMap for schemas)
+                if (analysis.UnknownTables.Length == 0 && analysis.UnknownColumns.Length == 0 && analysis.NonDatasetSchemas.Length == 0)
                 {
+                    // safe to transform - all references match DDL
                     var transformed = TransformToPostgres(expr);
                     outputs.Add((r, expr, transformed));
-                    
-                    // Log warnings about unknown tables/columns but still transform
-                    if (analysis.UnknownTables.Length > 0 || analysis.UnknownColumns.Length > 0 || analysis.NonDatasetSchemas.Length > 0)
-                    {
-                        DebugWriteLine($"Row {r}: WARNING: Transformed SQL with unknown tables/columns/schemas - UnknownTables: {string.Join(", ", analysis.UnknownTables)}, UnknownColumns: {string.Join(", ", analysis.UnknownColumns)}, NonDatasetSchemas: {string.Join(", ", analysis.NonDatasetSchemas)}");
-                    }
 
                     // Print formatted result
                     Console.WriteLine($"row {r}:");
@@ -1983,9 +2089,14 @@ namespace ETL_rod787.Services
                     Console.WriteLine("====================================================");
                     Console.WriteLine();
                 }
-                catch (Exception ex)
+                else
                 {
-                    DebugWriteLine($"Row {r}: ERROR: Failed to transform SQL: {ex.Message}");
+                    var parts = new List<string>();
+                    if (analysis.UnknownTables.Length > 0) parts.Add($"unknown tables: {string.Join(',', analysis.UnknownTables)}");
+                    if (analysis.UnknownColumns.Length > 0) parts.Add($"unknown columns: {string.Join(',', analysis.UnknownColumns)}");
+                    if (analysis.NonDatasetSchemas.Length > 0) parts.Add($"non-dataset schemas: {string.Join(',', analysis.NonDatasetSchemas)}");
+                    var msg = parts.Count == 0 ? "unknown references" : string.Join("; ", parts);
+                    DebugWriteLine($"Row {r}: ERROR: {msg}");
                 }
             }
 
@@ -2086,14 +2197,26 @@ namespace ETL_rod787.Services
                 var row = sheet.GetRow(r);
                 if (row == null) continue;
 
-                // Get columns: A=0 (table_name), B=1 (column_name), C=2 (code), E=4 (description), F=5 (rule_param/expression), H=7 (severity), I=8 (additional context)
-                string tableName = row.GetCell(0)?.ToString()?.Trim() ?? "";
-                string columnName = row.GetCell(1)?.ToString()?.Trim() ?? "";
-                string code = row.GetCell(2)?.ToString()?.Trim() ?? "";
-                string description = row.GetCell(4)?.ToString()?.Trim() ?? "";
-                string expression = row.GetCell(5)?.ToString()?.Trim() ?? "";
-                string severity = row.GetCell(7)?.ToString()?.Trim() ?? "";
-                string additionalContext = row.GetCell(8)?.ToString()?.Trim() ?? "";
+                // Helper function to read cell value (handles formulas)
+                string GetCellValue(ICell? cell)
+                {
+                    if (cell == null) return "";
+                    if (cell.CellType == NPOI.SS.UserModel.CellType.Formula)
+                    {
+                        var formulaEvaluator = workbook.GetCreationHelper().CreateFormulaEvaluator();
+                        var evaluatedCell = formulaEvaluator.Evaluate(cell);
+                        return evaluatedCell?.StringValue ?? cell.ToString();
+                    }
+                    return cell.ToString();
+                }
+                
+                string tableName = GetCellValue(row.GetCell(columnIndexTableName))?.Trim() ?? "";
+                string columnName = GetCellValue(row.GetCell(columnIndexColumnName))?.Trim() ?? "";
+                string code = GetCellValue(row.GetCell(columnIndexCode))?.Trim() ?? "";
+                string description = GetCellValue(row.GetCell(columnIndexDescription))?.Trim() ?? "";
+                string expression = GetCellValue(row.GetCell(columnIndexExpression))?.Trim() ?? "";
+                string severity = GetCellValue(row.GetCell(columnIndexSeverity))?.Trim() ?? "";
+                string additionalContext = GetCellValue(row.GetCell(columnIndexAdditionalContext))?.Trim() ?? "";
 
                 // Skip if required fields are empty
                 if (string.IsNullOrWhiteSpace(tableName) || 
@@ -2182,13 +2305,14 @@ namespace ETL_rod787.Services
                     columnName = ddlColumnName;
                 }
 
-                string operatorCode;
+                string? operatorCode = null; // Initialize as null - must be set in one of the branches below
                 string? jsonString = null;
                 bool ruleParamIsNull = false;
                 string ruleLevel = "COLUMN";
 
                 // CRITICAL: Check if this row has a transformed SQL query FIRST
                 // ALL SQL expressions MUST have operator_code = 'SQL'
+                // Only use transformed SQL from ProcessExpressionsFromExcel (which validates against DDL)
                 if (transformedByRow.ContainsKey(r))
                 {
                     // SQL query case - add message column and wrap in {"sql": "..."}
@@ -2199,39 +2323,6 @@ namespace ETL_rod787.Services
                         ["sql"] = sqlWithMessage
                     };
                     jsonString = jsonObject.ToJsonString();
-                }
-                // If no transformed SQL but expression exists and looks like SQL, try to transform it now
-                // This handles cases where ProcessExpressionsFromExcel rejected it but we still want to transform
-                else if (!string.IsNullOrWhiteSpace(expression))
-                {
-                    // More strict check: must start with SELECT, WITH, or contain SELECT ... FROM pattern
-                    bool looksLikeSql = Regex.IsMatch(expression.Trim(), @"^\s*(SELECT|WITH|INSERT|UPDATE|DELETE)\b", RegexOptions.IgnoreCase) ||
-                                       Regex.IsMatch(expression, @"\bSELECT\s+.*?\s+FROM\b", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-                    
-                    if (looksLikeSql)
-                    {
-                        try
-                        {
-                            // Try to transform the SQL expression (skip validation - just transform)
-                            string transformedSql = TransformToPostgres(expression);
-                            if (!string.IsNullOrWhiteSpace(transformedSql) && transformedSql != expression)
-                            {
-                                operatorCode = "SQL";
-                                string sqlWithMessage = AddMessageColumnToSql(transformedSql, additionalContext);
-                                var jsonObject = new JsonObject
-                                {
-                                    ["sql"] = sqlWithMessage
-                                };
-                                jsonString = jsonObject.ToJsonString();
-                            }
-                            // If transformation didn't change anything, fall through to description-based logic
-                        }
-                        catch (Exception ex)
-                        {
-                            // If transformation fails, fall through to description-based logic
-                            Console.WriteLine($"Warning: Could not transform SQL for row {r}: {ex.Message}");
-                        }
-                    }
                 }
                 // Check for MATCH patterns in Column F (expression) - PATTERN operator_code
                 else if (!string.IsNullOrWhiteSpace(expression) && expression.Contains("MATCH", StringComparison.OrdinalIgnoreCase))
@@ -2476,6 +2567,17 @@ namespace ETL_rod787.Services
                         }
                     }
                 }
+                
+                // CRITICAL: Skip row if operatorCode was not set (no matching pattern found)
+                if (operatorCode == null)
+                {
+                    Console.WriteLine($"Skipping row {r}: No operator_code could be determined (no transformed SQL, no matching description pattern)");
+                    Console.WriteLine($"  Table: {tableName}, Column: {columnName}, Description: {description}, Expression: {expression?.Substring(0, Math.Min(100, expression?.Length ?? 0))}");
+                    continue;
+                }
+                
+                // DEBUG: Log what operatorCode was set to
+                Console.WriteLine($"Row {r}: operatorCode = '{operatorCode}', has jsonString = {jsonString != null}, has transformed SQL = {transformedByRow.ContainsKey(r)}");
                 
                 // Build INSERT statement
                 string ruleParamValue;

@@ -76,8 +76,12 @@ namespace ETL_rod787.Services
         // Column type dictionary - uses instance dictionary from base class
         protected Dictionary<string, string> ColumnTypes => _columnTypes;
 
-        public QCTransformatorMSSQL(string path, string ddl, int expressionsStartRow, int expressionsEndRow, Dictionary<string, string>? schemaMap = null) 
-            : base(path, ddl, expressionsStartRow, expressionsEndRow, schemaMap)
+        public QCTransformatorMSSQL(string path, string ddl, int expressionsStartRow, int expressionsEndRow, Dictionary<string, string>? schemaMap = null,
+            Dictionary<(string Schema, string Table), string>? schemaTableMap = null,
+            int? columnIndexTableName = null, int? columnIndexColumnName = null, int? columnIndexCode = null,
+            int? columnIndexDescription = null, int? columnIndexExpression = null, int? columnIndexSeverity = null, int? columnIndexAdditionalContext = null) 
+            : base(path, ddl, expressionsStartRow, expressionsEndRow, schemaMap, schemaTableMap,
+                columnIndexTableName, columnIndexColumnName, columnIndexCode, columnIndexDescription, columnIndexExpression, columnIndexSeverity, columnIndexAdditionalContext)
         {
         }
 
@@ -739,26 +743,36 @@ namespace ETL_rod787.Services
                 string schemaName = match.Groups[1].Value;
                 string tableName = match.Groups[2].Success ? match.Groups[2].Value : match.Groups[3].Value;
                 
-                // Check if this schema is a source schema or target schema
+                // Check schema+table mapping first (overrides schema-only mapping)
                 string targetSchema = schemaName;
                 string sourceSchema = null;
                 
-                // Check if schemaName is a target schema (value in SchemaMap)
-                foreach (var kvp in SchemaMap)
-                {
-                    if (kvp.Value.Equals(schemaName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        sourceSchema = kvp.Key;
-                        targetSchema = schemaName; // Already target schema
-                        break;
-                    }
-                }
-                
-                // If not found as target, check if it's a source schema
-                if (sourceSchema == null && SchemaMap.ContainsKey(schemaName))
+                // First check SchemaTableMap for (schema, table) combination
+                var schemaTableKey = (schemaName, tableName);
+                if (SchemaTableMap.ContainsKey(schemaTableKey))
                 {
                     sourceSchema = schemaName;
-                    targetSchema = SchemaMap[schemaName];
+                    targetSchema = SchemaTableMap[schemaTableKey];
+                }
+                else
+                {
+                    // Check if schemaName is a target schema (value in SchemaMap)
+                    foreach (var kvp in SchemaMap)
+                    {
+                        if (kvp.Value.Equals(schemaName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            sourceSchema = kvp.Key;
+                            targetSchema = schemaName; // Already target schema
+                            break;
+                        }
+                    }
+                    
+                    // If not found as target, check if it's a source schema
+                    if (sourceSchema == null && SchemaMap.ContainsKey(schemaName))
+                    {
+                        sourceSchema = schemaName;
+                        targetSchema = SchemaMap[schemaName];
+                    }
                 }
                 
                 // Find the table in ALL schemas (could be in any source schema)
@@ -812,6 +826,7 @@ namespace ETL_rod787.Services
             foreach (var schemaKvp in schemaTableColumns)
             {
                 string sourceSchema = schemaKvp.Key;
+                // For standalone tables, use schema mapping (schema+table mapping doesn't apply without schema prefix)
                 string targetSchema = SchemaMap.ContainsKey(sourceSchema) ? SchemaMap[sourceSchema] : sourceSchema;
                 
                 foreach (var tableNameEntry in schemaKvp.Value)
