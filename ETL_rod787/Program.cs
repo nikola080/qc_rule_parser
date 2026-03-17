@@ -9,8 +9,8 @@ string ddl = File.ReadAllText("ddl.sql"); // Or provide DDL string directly
 // Define schema name mapping (default mapping for all tables in a schema)
 var schemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 {
-    { "dataset_93520", "rod184_wise3_new" },
-    { "dataset_93519", "rod806_wise5_new" } // Default: all tables in dataset_93519 go to rod806_wise5_new
+    { "dataset_93520", "rod184_wise3" },
+    { "dataset_93519", "rod806_wise5" } // Default: all tables in dataset_93519 go to rod806_wise5_new
 };
 /*var schemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 {
@@ -20,25 +20,10 @@ var schemaMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 // Define schema+table mapping (overrides schema mapping for specific tables)
 var schemaTableMap = new Dictionary<(string Schema, string Table), string>(new SchemaTableComparer())
 {
-    { ("dataset_93519", "dataflowmetadata"), "rod14_wise6_new" },
-    { ("dataset_93519", "observedproperty_qcreference"), "rod14_wise6_new" }
+    { ("dataset_93519", "monitoringsite"), "vocabulary" },
+    { ("dataset_93519", "spatialunit"), "vocabulary" },
+    { ("dataset_93519", "waterbody"), "vocabulary" },
 };
-
-// Helper class for schema+table comparer
-class SchemaTableComparer : IEqualityComparer<(string Schema, string Table)>
-{
-    public bool Equals((string Schema, string Table) x, (string Schema, string Table) y)
-    {
-        return string.Equals(x.Schema, y.Schema, StringComparison.OrdinalIgnoreCase) &&
-               string.Equals(x.Table, y.Table, StringComparison.OrdinalIgnoreCase);
-    }
-    
-    public int GetHashCode((string Schema, string Table) obj)
-    {
-        return StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Schema) ^
-               StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Table);
-    }
-}
 
 Console.WriteLine("DDL: ", ddl);
 Console.WriteLine("\n=== Schema Mapping Configuration ===");
@@ -97,7 +82,7 @@ int expressionsEndRow = string.IsNullOrWhiteSpace(input) ? 152 : int.Parse(input
 Console.WriteLine($"\nUsing columns: Table={colTableName}, Column={colColumnName}, Code={colCode}, Description={colDescription}, Expression={colExpression}, Severity={colSeverity}, AdditionalContext={colAdditionalContext}");
 Console.WriteLine($"Processing rows {expressionsStartRow} to {expressionsEndRow}\n");
 
-var transformer = new QCTransformatorMSSQL("C:/Users/Korisnik/Desktop/nikola/rod184/qc_rules.xlsx", ddl, expressionsStartRow, expressionsEndRow, schemaMap, schemaTableMap,
+var transformer = new QCTransformatorMSSQL("D:\\Nikola\\qc_rule_parser\\ETL_rod787\\bin\\Debug\\net8.0\\QC_Rules.xlsx", ddl, expressionsStartRow, expressionsEndRow, schemaMap, schemaTableMap,
     columnIndexTableName: colTableName, columnIndexColumnName: colColumnName, columnIndexCode: colCode,
     columnIndexDescription: colDescription, columnIndexExpression: colExpression, columnIndexSeverity: colSeverity, columnIndexAdditionalContext: colAdditionalContext);
 var transformed = transformer.ProcessExpressionsFromExcel();
@@ -112,5 +97,37 @@ foreach (var item in transformed)
     Console.WriteLine();
 }
 
+// Write transformed SQL queries to sql_queries.sql
+using (var writer = new StreamWriter("sql_queries.sql"))
+{
+    writer.WriteLine("-- SQL-typed QC Rules");
+    writer.WriteLine($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+    writer.WriteLine($"-- Total SQL rules: {transformed.Count}");
+    writer.WriteLine();
+
+    foreach (var item in transformed)
+    {
+        writer.WriteLine($"-- Row {item.Row}");
+        writer.WriteLine(item.Transformed);
+        writer.WriteLine();
+    }
+}
+Console.WriteLine($"SQL queries written to sql_queries.sql ({transformed.Count} rules)");
+
 // Generate INSERT statements for qc_rules_internal table
-transformer.GenerateInsertStatements("output.txt");
+transformer.GenerateInsertStatements("output.sql");
+
+class SchemaTableComparer : IEqualityComparer<(string Schema, string Table)>
+{
+    public bool Equals((string Schema, string Table) x, (string Schema, string Table) y)
+    {
+        return string.Equals(x.Schema, y.Schema, StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(x.Table, y.Table, StringComparison.OrdinalIgnoreCase);
+    }
+    
+    public int GetHashCode((string Schema, string Table) obj)
+    {
+        return StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Schema) ^
+               StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Table);
+    }
+}

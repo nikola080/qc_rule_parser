@@ -773,25 +773,54 @@ namespace ETL_rod787.Services
                         sourceSchema = schemaName;
                         targetSchema = SchemaMap[schemaName];
                     }
+                    
+                    // Re-check SchemaTableMap using resolved source schema
+                    // Handles SQL that already uses target schema names (e.g., rod806_wise5.MonitoringSite
+                    // should become vocabulary."monitoringSite" when SchemaTableMap maps
+                    // (dataset_93519, monitoringsite) -> vocabulary)
+                    if (sourceSchema != null)
+                    {
+                        var sourceKey = (sourceSchema, tableName);
+                        if (SchemaTableMap.ContainsKey(sourceKey))
+                        {
+                            targetSchema = SchemaTableMap[sourceKey];
+                        }
+                    }
                 }
                 
-                // Find the table in ALL schemas (could be in any source schema)
+                // Find the table's DDL name, preferring the target schema for correct casing
                 string lowerTableName = tableName.ToLowerInvariant();
                 string camelCaseTable = null;
                 
-                // Search all schemas for the table
-                foreach (var schemaKvp in schemaTableColumns)
+                // First try the target schema for the correct table name casing
+                if (schemaTableColumns.ContainsKey(targetSchema))
                 {
-                    var schemaTables = schemaKvp.Value;
-                    foreach (var tableEntry in schemaTables)
+                    foreach (var tableEntry in schemaTableColumns[targetSchema])
                     {
                         if (tableEntry.Key.Equals(lowerTableName, StringComparison.OrdinalIgnoreCase))
                         {
-                            camelCaseTable = tableEntry.Key; // Already CamelCase from DDL
+                            camelCaseTable = tableEntry.Key;
                             break;
                         }
                     }
-                    if (camelCaseTable != null) break;
+                }
+                
+                // Fallback: search all schemas
+                if (camelCaseTable == null)
+                {
+                    foreach (var schemaKvp in schemaTableColumns)
+                    {
+                        var schemaTables = schemaKvp.Value;
+                        foreach (var tableEntry in schemaTables)
+                        {
+                            if (tableEntry.Key.Equals(lowerTableName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                camelCaseTable = tableEntry.Key;
+                                break;
+                            }
+                        }
+                        if (camelCaseTable != null) break;
+                    }
                 }
                 
                 if (camelCaseTable != null)
@@ -907,8 +936,9 @@ namespace ETL_rod787.Services
             // Rule: If a table reference has no schema prefix, it's a CTE and should be unquoted
             sql = RemoveQuotesFromUnqualifiedCteReferences(sql, cteNames);
 
-            // Final trim
+            // Final trim and ensure semicolon terminator
             sql = sql.Trim();
+            if (!sql.EndsWith(";")) sql += ";";
 
             return sql;
         }
